@@ -1,801 +1,985 @@
-#!/usr/bin/env python3
-"""draw.py — fresh pure-stdlib 2D renderer for the news-image front page.
+"""Fresh front-page renderer for the 26 November 2026 news image.
 
-A Raster holds an RGB buffer at 2x supersampling and downsamples with a
-2x2 box average for smooth edges. Text is drawn from a hand-built stroke
-font: every glyph is a set of polylines on a 12x20 grid (cap top y=0,
-baseline y=14, x-height top y=5), stored as compact strings and parsed at
-import time. Scenes are flat vector illustrations built from box / disc /
-poly / segment ops in normalized 0..1 box coordinates. The world map is a
-dotted land mask computed from continent polygons with a point-in-polygon
-test, with numbered pins for the lead stories. No third-party imports, no
-network, no fonts read from disk.
+Pure standard library: a small supersampled raster, a hand-built stroke
+font, flat vector scenes and a dotted world map. Reads the day's stories
+from data files (never from here) and paints one 1024x1024 page.
+
+Design notes (all my own):
+- Glyphs live on a 10-wide by 14-tall unit grid: cap top y=0, baseline
+  y=11, descender floor y=13. One vertical unit is size/11.5 pixels, so
+  cap height is about 0.96*size; one horizontal unit is size/9 * SX
+  pixels, so letters stay tall and narrow like a condensed face.
+- Text width is the sum of glyph advances plus a small gap between
+  neighbours (0.05 * size); bold only thickens strokes, never widths.
+- The raster is supersampled (default 2x) and downsampled on export, so
+  edges stay smooth without any extra dependency.
 """
+
 import math
 import struct
 import zlib
 
 # ---------------------------------------------------------------- palette
-PAPER = (248, 243, 231)      # warm cream page
-INK = (20, 24, 38)           # near-black navy ink
-NAVY = (14, 28, 60)          # masthead band
-NAVY2 = (24, 44, 88)         # numbers panel
-RED = (170, 28, 24)          # accent red (sub-headline, date check)
-BLUE = (32, 86, 156)
-TEAL = (0, 120, 120)
-GOLD = (184, 130, 24)
-GREEN = (30, 114, 64)
-GRAY = (102, 102, 96)
-PALE = (234, 228, 212)       # pale panel
-PALE2 = (223, 215, 193)
+# Colours sampled from the target front page (the rendered reference PNG).
+PAPER = (248, 243, 231)   # warm newsprint cream
+INK = (20, 24, 38)        # near-black text ink
+NIGHT = (20, 24, 38)      # darkest scene tone
+NAVY = (14, 28, 60)       # masthead band and giant date
+NAVY2 = (24, 44, 88)      # numbers-panel background
+BLUE = (32, 86, 156)      # reported blue
+RED = (170, 28, 24)       # subheadline red and date-check red
+GOLD = (184, 130, 24)     # claim gold
+GREEN = (44, 120, 62)     # africa green
+GRAY = (110, 110, 108)    # world grey
+SKY = (190, 210, 232)     # pale daytime sky
+SAND = (232, 214, 170)    # warm sand tone
+TEAL = (30, 100, 150)     # mid sky blue
 WHITE = (255, 255, 255)
-SKY = (166, 198, 226)
-NIGHT = (22, 38, 82)
-SAND = (222, 198, 148)
+PALE = (232, 238, 244)    # pale blue-grey fill
+PALE2 = (237, 223, 197)   # pale warm fill
+
+# Horizontal squeeze applied to every glyph (see module docstring).
+SX = 0.74
 
 REGION_COLORS = {
     "Europe": (32, 86, 156),
     "Middle East": (170, 28, 24),
-    "Africa": (30, 114, 64),
+    "Africa": (44, 120, 62),
     "Asia": (184, 130, 24),
-    "Americas": (0, 120, 120),
-    "Oceania": (96, 96, 96),
-    "World": (70, 70, 70),
+    "Americas": (200, 80, 40),
+    "Oceania": (24, 44, 88),
+    "World": (110, 110, 108),
 }
 
 STATUS_COLORS = {
     "Reported": (32, 86, 156),
-    "Confirmed": (30, 114, 64),
     "Claim": (184, 130, 24),
-    "Ongoing": (170, 28, 24),
+    "Confirmed": (44, 120, 62),
+    "Ongoing": (120, 90, 160),
 }
 
-
-# ---------------------------------------------------------------- raster
-class Raster:
-    """RGB buffer rendered at ss-times supersampling, then averaged down."""
-
-    def __init__(self, w, h, ss=2, bg=PAPER):
-        self.w = w
-        self.h = h
-        self.ss = ss
-        self.W = w * ss
-        self.H = h * ss
-        self.buf = bytearray(self.W * self.H * 3)
-        self.fill(bg)
-
-    def _set(self, x, y, color):
-        if 0 <= x < self.W and 0 <= y < self.H:
-            i = (y * self.W + x) * 3
-            self.buf[i] = color[0]
-            self.buf[i + 1] = color[1]
-            self.buf[i + 2] = color[2]
-
-    def fill(self, color):
-        row = bytes(color) * self.W
-        for y in range(self.H):
-            self.buf[y * self.W * 3:(y + 1) * self.W * 3] = row
-
-    def box(self, x, y, w, h, color):
-        x = int(round(x * self.ss))
-        y = int(round(y * self.ss))
-        w = int(round(w * self.ss))
-        h = int(round(h * self.ss))
-        if w <= 0 or h <= 0:
-            return
-        x0 = max(0, x)
-        y0 = max(0, y)
-        x1 = min(self.W, x + w)
-        y1 = min(self.H, y + h)
-        if x1 <= x0 or y1 <= y0:
-            return
-        row = bytes(color) * (x1 - x0)
-        for yy in range(y0, y1):
-            i = (yy * self.W + x0) * 3
-            self.buf[i:i + (x1 - x0) * 3] = row
-
-    def disc(self, cx, cy, r, color):
-        cx = int(round(cx * self.ss))
-        cy = int(round(cy * self.ss))
-        r = int(round(r * self.ss))
-        if r <= 0:
-            return
-        for dy in range(-r, r + 1):
-            dx = int(math.sqrt(max(0, r * r - dy * dy)))
-            yy = cy + dy
-            if 0 <= yy < self.H:
-                x0 = max(0, cx - dx)
-                x1 = min(self.W - 1, cx + dx)
-                if x1 >= x0:
-                    row = bytes(color) * (x1 - x0 + 1)
-                    i = (yy * self.W + x0) * 3
-                    self.buf[i:i + (x1 - x0 + 1) * 3] = row
-
-    def seg(self, x1, y1, x2, y2, w, color):
-        """Thick segment with round ends, drawn as discs along the line."""
-        x1 *= self.ss
-        y1 *= self.ss
-        x2 *= self.ss
-        y2 *= self.ss
-        w *= self.ss
-        r = max(0.5, w / 2.0)
-        length = math.hypot(x2 - x1, y2 - y1)
-        steps = max(1, int(length) + 1)
-        for i in range(steps + 1):
-            t = i / steps
-            self.disc((x1 + (x2 - x1) * t) / self.ss,
-                      (y1 + (y2 - y1) * t) / self.ss,
-                      r / self.ss, color)
-
-    def poly(self, points, color):
-        """Scanline-filled polygon. Points are (x, y) in final coords."""
-        pts = [(x * self.ss, y * self.ss) for (x, y) in points]
-        if len(pts) < 3:
-            return
-        ys = [p[1] for p in pts]
-        y0 = max(0, int(math.floor(min(ys))))
-        y1 = min(self.H - 1, int(math.ceil(max(ys))))
-        n = len(pts)
-        for yy in range(y0, y1 + 1):
-            xs = []
-            for i in range(n):
-                x1, y1p = pts[i]
-                x2, y2p = pts[(i + 1) % n]
-                if (y1p <= yy < y2p) or (y2p <= yy < y1p):
-                    if y2p != y1p:
-                        xs.append(x1 + (yy - y1p) * (x2 - x1) / (y2p - y1p))
-            xs.sort()
-            for k in range(0, len(xs) - 1, 2):
-                xa = max(0, int(math.ceil(xs[k])))
-                xb = min(self.W - 1, int(math.floor(xs[k + 1])))
-                if xb >= xa:
-                    row = bytes(color) * (xb - xa + 1)
-                    i = (yy * self.W + xa) * 3
-                    self.buf[i:i + (xb - xa + 1) * 3] = row
-
-    def sample(self):
-        """2x2 box average into a 1x RGB byte string."""
-        out = bytearray(self.w * self.h * 3)
-        W = self.W
-        buf = self.buf
-        ss = self.ss
-        for y in range(self.h):
-            for x in range(self.w):
-                r = g = b = 0
-                for dy in range(ss):
-                    base = ((y * ss + dy) * W + x * ss) * 3
-                    for dx in range(ss):
-                        i = base + dx * 3
-                        r += buf[i]
-                        g += buf[i + 1]
-                        b += buf[i + 2]
-                n = ss * ss
-                o = (y * self.w + x) * 3
-                out[o] = r // n
-                out[o + 1] = g // n
-                out[o + 2] = b // n
-        return bytes(out)
-
-    def png(self):
-        """Encode the 1x image as PNG bytes (filter 0, zlib level 9)."""
-        px = self.sample()
-        w = self.w
-        h = self.h
-        raw = bytearray()
-        stride = w * 3
-        for y in range(h):
-            raw.append(0)
-            raw += px[y * stride:(y + 1) * stride]
-        comp = zlib.compress(bytes(raw), 9)
-
-        def chunk(typ, data):
-            c = struct.pack(">I", len(data)) + typ + data
-            c += struct.pack(">I", zlib.crc32(typ + data) & 0xFFFFFFFF)
-            return c
-
-        ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
-        return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
-                + chunk(b"IDAT", comp) + chunk(b"IEND", b""))
-
-# ---------------------------------------------------------------- stroke font
-# Glyph grid: x 0..12, y 0..20, baseline y=14, cap top y=0, x-height top
-# y=5. Cap height is 14 units, so text size in px is the cap height and
-# a full line (cap + descender) spans 20 units: line height = size*20/14.
-# Each entry: (advance, "stroke; stroke; ...") where a stroke is
-# "x,y x,y ..." — a polyline through those points. A single point draws
-# a dot. The parser below turns the strings into point lists once.
+# ------------------------------------------------------------------- font
+# Each glyph: "advance|stroke;stroke" where a stroke is "x,y x,y ...".
+# Grid: x 0..10, y 0..14, cap top 0, x-height top 4, baseline 11.
 GLYPHS = {
-    "A": (11, "0,14 5.5,0 11,14; 2.8,9.2 8.2,9.2"),
-    "B": (10, "0,0 0,14; 0,0 7,0 9.6,2.4 7.6,6.4 0,6.4; 0,6.4 8,6.4 10,9.2 8,14 0,14"),
-    "C": (10, "9.6,2.4 6,0 2,2 0,7 2,12 6,14 9.6,11.6"),
-    "D": (11, "0,0 0,14; 0,0 7,0 11,4 11,10 7,14 0,14"),
-    "E": (9.6, "0,0 0,14; 0,0 9,0; 0,7 7.6,7; 0,14 9,14"),
-    "F": (9.6, "0,0 0,14; 0,0 9,0; 0,7 7.6,7"),
-    "G": (11, "9.6,2.4 6,0 2,2 0,7 2,12 6,14 10,14 10,9 6.4,9"),
-    "H": (11, "0,0 0,14; 11,0 11,14; 0,7 11,7"),
-    "I": (5, "2.5,0 2.5,14; 0,0 5,0; 0,14 5,14"),
-    "J": (10, "10,0 10,11 7,14 3,14 1,11.6; 7,0 10,0"),
-    "K": (11, "0,0 0,14; 10,0 0,7.6; 3.6,6 11,14"),
-    "L": (10, "0,0 0,14; 0,14 10,14"),
-    "M": (13, "0,14 0,0; 0,0 6.5,8 13,0; 13,0 13,14"),
-    "N": (11, "0,14 0,0; 0,0 11,14; 11,0 11,14"),
-    "O": (11, "5.5,0 2,2 0,7 2,12 5.5,14 9,12 11,7 9,2 5.5,0"),
-    "P": (10, "0,0 0,14; 0,0 7.6,0 10,2.4 8,6.4 0,6.4"),
-    "Q": (11, "5.5,0 2,2 0,7 2,12 5.5,14 9,12 11,7 9,2 5.5,0; 7.6,10.4 11,14"),
-    "R": (11, "0,0 0,14; 0,0 7.6,0 10,2.4 8,6.4 0,6.4; 4.4,6.4 11,14"),
-    "S": (10, "10,2.4 7.6,0 3,0 1,2 1,5 5,7 9,7.6 10,10 8,14 3,14 1,12"),
-    "T": (11, "5.5,0 5.5,14; 0,0 11,0"),
-    "U": (11, "0,0 0,10 2,14 9,14 11,10 11,0"),
-    "V": (11, "0,0 5.5,14 11,0"),
-    "W": (15, "0,0 3,14 7.5,5 12,14 15,0"),
-    "X": (11, "0,0 11,14; 11,0 0,14"),
-    "Y": (11, "0,0 5.5,7; 11,0 5.5,7; 5.5,7 5.5,14"),
-    "Z": (11, "0,0 11,0; 11,0 0,14; 0,14 11,14"),
-    "0": (11, "5.5,0 2,2 0,7 2,12 5.5,14 9,12 11,7 9,2 5.5,0"),
-    "1": (9, "6,0 6,14; 3,3 6,0; 3,14 9,14"),
-    "2": (10, "1,3 3,0 7,0 9.6,3 9.6,6 1,14 10,14"),
-    "3": (10, "1,2 3,0 7,0 9.6,2.4 8,5.6 5,6.4; 5,6.4 8.4,7.2 10,9.6 8,14 3,14 1,12"),
-    "4": (10, "8.4,0 8.4,14; 1,9.6 8.4,9.6; 8.4,0 1.6,9.6"),
-    "5": (10, "10,0 1,0 1,6.4 6,6.4 9.6,9 8,14 3,14 1,12"),
-    "6": (10, "9.6,2 7,0 3,2 1.6,6 3,12 6,14 9,12 9.6,9 7,6.4 3.6,6.4 1.6,9.6"),
-    "7": (10, "0,0 10,0; 10,0 3,14"),
-    "8": (10, "5,0 2,2 1.6,5 4,7 8,7 9.6,5 8,2 5,0; 4,7 2,9 1.6,11.6 4,14 7.6,14 9.6,11.6 8,9 4,7"),
-    "9": (10, "9.6,5 8,1.6 5,0 2,2 1.6,5 3,7.6 6.4,7.6 9.6,5.6; 9.6,5.6 9.6,12 7,14 3.6,14 1.6,12"),
+    " ": "3.2|",
+    "!": "3|1.5,0 1.5,8;1.5,10 1.5,11",
+    '"': "3.6|1,0 1,2.5;2.6,0 2.6,2.5",
+    "$": "7|3.5,0 3.5,11;5.5,1.5 4,0 2,0 1,1.5 1,4 2.5,5.5 4.5,6.5 6,8 6,9.5 4.5,11 2.5,11 1,10",
+    "%": "8|0.8,2 1.8,0.5 3.2,1 3.2,3 2,4.5 0.8,4;5.5,8 6.5,6.5 7,7.5 7,9.5 6,11 5,10.5;6.8,0.5 0.5,10.8",
+    "&": "7|5.5,0 4,0.5 2.5,2 2,4 3,6 5,7.5 6,9 5,11 3,11 1.5,9.5;2,4 0.8,5.5 0.8,8 2,10 4,10.5",
+    "'": "2.6|1.3,0 1.3,2.5",
+    "(": "4|3,0 1.5,2.5 1,5.5 1.5,8.5 3,11",
+    ")": "4|1,0 2.5,2.5 3,5.5 2.5,8.5 1,11",
+    "+": "7|3.5,2 3.5,9;0.8,5.5 6.2,5.5",
+    ",": "3|1.5,9.5 1.5,11 1,12.5 0.3,13",
+    "-": "5|0.8,7 5,7",
+    ".": "3|1.5,10 1.5,11",
+    "/": "5|4.5,0 0.8,11",
+    "0": "7|1.5,1 3.5,0 5.5,1 6.2,3 6.2,8 5.5,10.5 3.5,11 1.5,10.5 0.8,8 0.8,3 1.5,1",
+    "1": "7|4.5,0 3.5,2 3.5,11;1.5,11 5.5,11",
+    "2": "7|1,3 1,1 3.5,0 6,1 6,4 1,11 6,11",
+    "3": "7|1,1 3.5,0 6,1 6,4 3.5,5.5;3.5,5.5 6,6 6,9 3.5,11 1,10",
+    "4": "7|5,0.5 5,11;0.8,8 6.2,8;0.8,8 5,0.5",
+    "5": "7|6,0 1,0 1,5 4,5 6,6.5 6,9 3.5,11 1,10",
+    "6": "7|5.5,0 3.5,0 1.5,2 1,5 1,8 2,10.5 4,11 5.5,10 6,8 5,6 3,6",
+    "7": "7|1,0 6,0 3,11;1.5,5.5 4,5.5",
+    "8": "7|2,0.5 5,0.5 6,2 5.5,4 4,5 2,5.5 1,7 1.5,9.5 3.5,11 5,10.5 6,9 5.5,7",
+    "9": "7|1,8 1,5 2,1 4,0 5.5,1 6,3 5.5,6 3,6;5,6 6,9 4,11 2,10.5",
+    ":": "3|1.5,4 1.5,5.5;1.5,9.5 1.5,11",
+    ";": "3|1.5,4 1.5,5.5;1.5,9.5 1.5,11 1,12.5 0.3,13",
+    "=": "7|0.8,4 6.2,4;0.8,7.5 6.2,7.5",
+    "?": "7|1.5,3 1.5,1.5 3,0 5,0.5 6,2 5.5,4 3.5,5.5 3.5,7;3.5,9.5 3.5,11",
+    "A": "7.4|0.5,11 3.7,0 6.9,11;2.2,7 5.2,7",
+    "B": "7.4|0.5,11 0.5,0;0.5,0 4.5,0 6.5,1.5 6.5,4 4.5,5.5 0.5,5.5;4.5,5.5 6.5,6.5 6.5,9 4.5,11 0.5,11",
+    "C": "7.4|6.5,2.5 5,0.5 2.5,0 1,2 0.5,5.5 1,9 2.5,11 5,11 6.5,9",
+    "D": "7.4|0.5,11 0.5,0;0.5,0 4,0 6.5,2 6.9,5.5 6.5,9 4,11 0.5,11",
+    "E": "7.4|0.5,11 0.5,0 6.5,0;0.5,5.5 5,5.5;0.5,11 6.5,11",
+    "F": "6.2|0.5,11 0.5,0 5.4,0;0.5,5.5 4.2,5.5",
+    "G": "7.4|6.5,2.5 5,0.5 2.5,0 1,2 0.5,5.5 1,9 2.5,11 5,11 6.5,9 6.5,7 4,7",
+    "H": "7.4|0.5,0 0.5,11;6.9,0 6.9,11;0.5,5.5 6.9,5.5",
+    "I": "3.8|0.6,0 3.2,0;1.9,0 1.9,11;0.6,11 3.2,11",
+    "J": "5.2|1,0 4.4,0;4.4,0 4.4,8 3.6,10.5 2,11 1,10",
+    "K": "7.4|0.5,0 0.5,11;6.9,0 0.5,6;2,4.5 6.9,11",
+    "L": "6.0|0.5,0 0.5,11 5.5,11",
+    "M": "7.4|0.5,11 0.5,0 3.7,7 6.9,0 6.9,11",
+    "N": "7.4|0.5,11 0.5,0 6.9,11 6.9,0",
+    "O": "7.4|2,0.5 5,0.5 6.7,2.5 6.9,5.5 6.7,8.5 5,10.8 2,10.8 0.7,8.5 0.5,5.5 0.7,2.5",
+    "P": "7.4|0.5,11 0.5,0;0.5,0 4.5,0 6.5,1.5 6.5,4 4.5,5.5 0.5,5.5",
+    "Q": "7.4|2,0.5 5,0.5 6.7,2.5 6.9,5.5 6.7,8.5 5,10.8 2,10.8 0.7,8.5 0.5,5.5 0.7,2.5;4.5,8 7,11.5",
+    "R": "7.4|0.5,11 0.5,0;0.5,0 4.5,0 6.5,1.5 6.5,4 4.5,5.5 0.5,5.5;3.5,5.5 6.9,11",
+    "S": "7.4|6,1.5 4.5,0 2,0 0.8,1.5 0.8,4 2.5,5.5 5,6.5 6.5,8 6.5,9.5 5,11 2.5,11 1,10",
+    "T": "6.4|0.5,0 5.9,0;3.2,0 3.2,11",
+    "U": "7.4|0.5,0 0.5,8 1.5,10.5 3.7,11 5.9,10.5 6.9,8 6.9,0",
+    "V": "7.4|0.5,0 3.7,11 6.9,0",
+    "W": "9.6|0.5,0 2,11 4.8,3 7.6,11 9.1,0",
+    "X": "7.4|0.5,0 6.9,11;6.9,0 0.5,11",
+    "Y": "7.4|0.5,0 3.7,5.5 6.9,0;3.7,5.5 3.7,11",
+    "Z": "7.4|0.5,0 6.9,0 0.5,11 6.9,11",
+    "a": "6.6|6,4.5 5,4 2.5,4 1,5.5 1,8 2,10.5 4,11 5.5,10 6,8 6,4.5;6,4.5 6,11",
+    "b": "6.6|1,0 1,11;1,8 2.5,9.8 4,9.8 5.5,8 6,6.5 5.5,5 4,4 2.5,4 1,5.5",
+    "c": "6.2|5.6,5.5 4.2,4 2.4,4 1,5.5 0.8,8 1.9,10.5 3.8,11 5.6,10",
+    "d": "6.6|6,0 6,11;6,8 4.5,9.8 2.5,9.8 1,8 0.8,6.5 2,4.5 4,4 6,5",
+    "e": "6.6|1,8 1.5,5.5 3,4 5,4 6,5.5 6,7 4,8.5 2,8.5 1,7.5;1,8 6,8",
+    "f": "4.8|2.6,11 2.6,2.5 3.4,0.5 4.6,0;0.8,4.5 4.6,4.5",
+    "g": "6.4|1,8 1.5,5.5 2.9,4 4.7,4 5.6,5.5 5.6,8 4.3,10.5 2.4,10.5 1,9;5.6,8 5.2,11.5 3.8,13 2,13",
+    "h": "6.6|1,0 1,11;1,7 2.5,4.5 4.5,4.5 6,6 6,11",
+    "i": "2.6|1.3,4.5 1.3,11;1.3,0.8 1.3,2",
+    "j": "2.6|2,0.8 2,2;2,4.5 2,11 1.5,12.5 0.5,13",
+    "k": "6.2|1,0 1,11;5.6,4 1,7;2.1,5.8 5.6,11",
+    "l": "2.6|1.3,0 1.3,11",
+    "m": "9.6|1,11 1,4.5;1,7 2,4.5 3.5,4.5 4.8,6 4.8,11;4.8,7 5.8,4.5 7.3,4.5 8.6,6 8.6,11",
+    "n": "6.6|1,11 1,4.5;1,7 2.5,4.5 4.5,4.5 6,6 6,11",
+    "o": "6.6|2,4.5 4,4 5.5,5.5 6,8 5,10.5 3,11 1.5,10 0.8,8 1.5,5.5",
+    "p": "6.6|1,4.5 1,13;1,8 2.5,9.8 4,9.8 5.5,8 6,6.5 5.5,5 4,4 2.5,4 1,5.5",
+    "q": "6.6|6,4.5 6,13;6,8 4.5,9.8 3,9.8 1.5,8 1,6.5 1.5,5 3,4 4.5,4 6,5.5",
+    "r": "5.2|1,11 1,4.5;1,7 2.2,4.5 3.6,4.5 4.8,5.5",
+    "s": "6.2|5.2,5.5 3.8,4 1.9,4 1,5.5 1,7 2.4,8.5 4.2,9 5.4,10 5.2,10.8 3.8,11 1.9,11 1,10",
+    "t": "4.8|2,1.5 2.8,0.5 2.8,11;0.8,4.5 4.6,4.5",
+    "u": "6.6|1,4.5 1,8.5 2,10.5 3.5,11 5,10.5 6,8.5 6,4.5",
+    "v": "6.6|0.8,4.5 3.5,11 6.2,4.5",
+    "w": "9.6|0.8,4.5 2,11 4.8,6 7.6,11 8.8,4.5",
+    "x": "6.6|0.8,4.5 6,11;6,4.5 0.8,11",
+    "y": "6.6|0.8,4.5 3.5,11 6.2,4.5;3.5,11 2.8,13",
+    "z": "6.6|0.8,4.5 6,4.5 0.8,11 6,11",
+    "°": "4|1.5,0.5 2.5,0 3.2,1 3,2.5 2,3.2 1,2.5 0.8,1",
+    "·": "3|1.5,6.5 1.5,8",
+    "×": "6|1,2 5,9;5,2 1,9",
+    "–": "6|0.8,7 5.5,7",
+    "—": "8|0.8,7 7.2,7",
+    "‘": "2.6|1.3,0 0.8,2.5",
+    "’": "2.6|1.3,0 1.8,2.5",
+    "“": "5|1,0 0.8,2.5;3.5,0 3.3,2.5",
+    "”": "5|1,0 1.3,2.5;3.5,0 3.8,2.5",
+    "•": "4|1,6 2,5 3,6 3,8 2,9 1,8",
+    "−": "6|0.8,5.5 5.5,5.5",
 }
 
-GLYPHS.update({
-    "a": (10, "9.6,5.6 9.6,14; 9.6,6.8 6,5 2.4,6.4 1.4,9.6 3.2,12.8 6.4,13.8 9.6,12.4"),
-    "b": (10, "0,0 0,14; 0,8 4,5 8,6 9.6,9.6 7,13.6 3,13.6 0,11"),
-    "c": (9.6, "9.2,6.8 6,5 2.4,6.4 1.4,9.6 3.2,12.8 6.4,13.8 9.2,12.4"),
-    "d": (10, "10,0 10,14; 10,8 6,5 2.4,6.4 1.4,9.6 3.2,12.8 6.4,13.8 10,12.4"),
-    "e": (9.6, "9.2,9.6 6,5 2.4,6.4 1.4,9.6 3.2,12.8 6.4,13.8 9.2,12; 1.4,9.6 9.2,9.6"),
-    "f": (8, "6,2.4 4,0 1.6,2; 4,1.6 4,14; 1.6,6.4 7.2,6.4"),
-    "g": (10, "10,8 6,5 2.4,6.4 1.4,9.6 3.2,12.8 6.4,13.8 10,12.4; 10,5.6 10,17 7,20 3,20 1.6,17.6"),
-    "h": (10, "0,0 0,14; 0,8 4,5 8,6.4 9.6,9.6 9.6,14"),
-    "i": (4, "2,5 2,14; 1.4,1.2 2.6,1.2"),
-    "j": (5, "3,5 3,16 1.6,19 0,19; 2.4,1.2 3.6,1.2"),
-    "k": (10, "0,0 0,14; 9.6,5.6 0,10; 3,8.4 9.6,14"),
-    "l": (4, "2,0 2,14"),
-    "m": (15, "0,5.6 0,14; 0,6 3.6,5 6.8,6.8 6.8,14; 6.8,6 10.4,5 14,6.8 14,14"),
-    "n": (10, "0,5.6 0,14; 0,6.4 3.6,5 8,6.4 9.6,9.6 9.6,14"),
-    "o": (10, "5,5 2,6.4 1.4,9.6 3.2,12.8 6,13.8 8.8,12.4 9.6,9.6 8,6 5,5"),
-    "p": (10, "0,5 0,20; 0,8 4,5 8,6 9.6,9.6 7,13.6 3,13.6 0,11"),
-    "q": (10, "10,5 10,20; 10,8 6,5 2.4,6.4 1.4,9.6 3.2,12.8 6.4,13.8 10,12.4"),
-    "r": (8, "0,5.6 0,14; 0,6.8 3,5 7,6"),
-    "s": (9.6, "9.2,6.8 6.8,5 3.2,5.6 1.6,7.6 2.4,10 5.2,11.2 8,12 8.8,13.8 6,14 2.8,13.6 1.6,12"),
-    "t": (7, "3.6,0 3.6,14; 0.8,6 6.4,6"),
-    "u": (10, "0,5.6 0,10.4 2,13.6 6.4,13.6 8.6,11.2 9.6,5.6"),
-    "v": (10, "0,5.6 5,14 10,5.6"),
-    "w": (14, "0,5.6 3,14 7,7 11,14 14,5.6"),
-    "x": (10, "0,5.6 10,14; 10,5.6 0,14"),
-    "y": (10, "0,5.6 5,13 10,5.6; 5,13 5,18 2.4,20 1,19"),
-    "z": (10, "0,5.6 10,5.6; 10,5.6 0,14; 0,14 10,14"),
-    " ": (5, ""),
-    ".": (4, "1.4,13 2.6,13 2.6,14.2 1.4,14.2"),
-    ",": (4, "1.4,13 2.6,13 2.6,14.2 1.4,14.2; 2,14.2 0.8,17.2"),
-    ":": (4, "1.4,6.4 2.6,6.4 2.6,7.6 1.4,7.6; 1.4,13 2.6,13 2.6,14.2 1.4,14.2"),
-    ";": (4, "1.4,6.4 2.6,6.4 2.6,7.6 1.4,7.6; 1.4,13 2.6,13 2.6,14.2 1.4,14.2; 2,14.2 0.8,17.2"),
-    "'": (3.6, "2,1 1.2,4.4"),
-    '"': (7, "1.6,1 0.8,4.4; 5.6,1 4.8,4.4"),
-    "-": (8, "1,9 7,9"),
-    "–": (10, "1,9 9,9"),
-    "—": (13, "0.6,9 12.4,9"),
-    "(": (6, "4.4,0 2,4 2,10 4.4,14"),
-    ")": (6, "1.6,0 4,4 4,10 1.6,14"),
-    "/": (7, "6,0 1,14"),
-    "&": (11, "9.6,1.6 6,0 2.4,2 1.6,5.6 4,8.4 9.6,14; 4,8.4 1,13 3,14 7,14"),
-    "%": (12, "2,1 1,3 3,5 4,3 3,1; 10,9 9,11 11,13 12,11 11,9; 10,0 2,14"),
-    "+": (10, "5,3 5,12; 1,7.6 9,7.6"),
-    "=": (10, "1,6 9,6; 1,11 9,11"),
-    "?": (10, "2,3 5,0 8,2 8,5 6,7 5,9; 4.4,12.6 5.6,12.6 5.6,13.8 4.4,13.8"),
-    "!": (4, "2,0 2,10; 1.4,12.6 2.6,12.6 2.6,13.8 1.4,13.8"),
-    "·": (4, "1.4,8 2.6,8 2.6,9.2 1.4,9.2"),
-    "•": (6, "1.6,6.4 4.4,6.4 4.4,9.2 1.6,9.2"),
-    "°": (5, "2.4,0.6 1.2,2 2.4,3.6 3.8,2 2.4,0.6"),
-    "$": (10, "9,2.4 6,0 2.4,1 1.6,4 4,6.4 8,7.6 9,10.4 7,14 3,14 1.6,12; 5,-1 5,15"),
-    "’": (3.6, "2,1 1.2,4.4"),
-    "‘": (3.6, "1.2,1 2,4.4"),
-    "“": (7, "1.6,1 0.8,4.4; 5.6,1 4.8,4.4"),
-    "”": (7, "1.6,1 0.8,4.4; 5.6,1 4.8,4.4"),
-    "×": (10, "1,3 9,13; 9,3 1,13"),
-    "−": (10, "1,9 9,9"),
-})
-
-
-def _clean(s):
-    """Fold curly quotes / ellipsis / currency signs to font glyphs."""
-    return (s.replace("“", '"').replace("”", '"').replace("‘", "'")
-             .replace("’", "'").replace("…", "...").replace("€", "EUR")
-             .replace("£", "GBP"))
+_FALLBACK = "?"
 
 
 def _parse_glyphs():
-    """Parse the compact stroke strings into point lists, once."""
+    """Turn the GLYPHS strings into (advance, strokes) point lists."""
     parsed = {}
-    for ch, (adv, spec) in GLYPHS.items():
+    for ch, spec in GLYPHS.items():
+        adv_txt, _, strokes_txt = spec.partition("|")
         strokes = []
-        if spec:
-            for part in spec.split(";"):
+        if strokes_txt:
+            for stroke_txt in strokes_txt.split(";"):
                 pts = []
-                for token in part.strip().split():
-                    xs, ys = token.split(",")
+                for pair in stroke_txt.split():
+                    xs, _, ys = pair.partition(",")
                     pts.append((float(xs), float(ys)))
-                if pts:
-                    strokes.append(pts)
-        parsed[ch] = (adv, strokes)
+                if len(pts) >= 2:
+                    strokes.append(tuple(pts))
+                elif len(pts) == 1:
+                    strokes.append((pts[0], pts[0]))
+        parsed[ch] = (float(adv_txt), tuple(strokes))
     return parsed
 
 
 PARSED = _parse_glyphs()
 
-# The glyph grid is wide (advance ~0.8 of cap height). The winning front
-# pages use a condensed face (advance ~0.55 of cap height) so a long
-# mixed-case date fits the page width. SX compresses glyph x positions;
-# stroke width is unchanged, so letters stay readable.
-SX = 0.78
+# ------------------------------------------------------- low-level drawing
+# All helpers work on a flat RGB bytearray in supersampled pixel space:
+# buf is W*H*3 bytes, row-major, no padding. Coordinates are floats in
+# that space; callers scale logical coordinates by the raster's ss first.
+
+
+def _hspan(buf, W, H, y, x0, x1, rgb):
+    """Fill one horizontal run [x0, x1) on row y, clipped to the canvas."""
+    if y < 0 or y >= H:
+        return
+    if x0 < 0:
+        x0 = 0
+    if x1 > W:
+        x1 = W
+    if x1 <= x0:
+        return
+    r, g, b = rgb
+    base = (y * W + x0) * 3
+    n = x1 - x0
+    buf[base:base + n * 3] = bytes((r, g, b)) * n
+
+
+def _disc_into(buf, W, H, cx, cy, rad, rgb):
+    """Fill a disc centred at (cx, cy) with radius rad (pixel units)."""
+    if rad <= 0:
+        return
+    r2 = rad * rad
+    y0 = int(math.floor(cy - rad))
+    y1 = int(math.ceil(cy + rad))
+    for y in range(y0, y1 + 1):
+        dy = y + 0.5 - cy
+        rest = r2 - dy * dy
+        if rest < 0:
+            continue
+        dx = math.sqrt(rest)
+        _hspan(buf, W, H, y, int(math.ceil(cx - dx)), int(math.floor(cx + dx)) + 1, rgb)
+
+
+def _poly_into(buf, W, H, pts, rgb):
+    """Scanline-fill a polygon given as [(x, y), ...] in pixel units."""
+    if len(pts) < 3:
+        return
+    ys = [p[1] for p in pts]
+    y0 = int(math.floor(min(ys)))
+    y1 = int(math.ceil(max(ys)))
+    n = len(pts)
+    for y in range(y0, y1 + 1):
+        yc = y + 0.5
+        xs = []
+        for i in range(n):
+            x1, y1p = pts[i]
+            x2, y2p = pts[(i + 1) % n]
+            if (y1p <= yc < y2p) or (y2p <= yc < y1p):
+                t = (yc - y1p) / (y2p - y1p)
+                xs.append(x1 + t * (x2 - x1))
+        if len(xs) < 2:
+            continue
+        xs.sort()
+        for k in range(0, len(xs) - 1, 2):
+            _hspan(buf, W, H, y, int(math.ceil(xs[k])), int(math.floor(xs[k + 1])) + 1, rgb)
+
+
+def _stroke_into(buf, W, H, pts, thick, rgb):
+    """Draw a thick polyline through pts (pixel units, round caps)."""
+    if not pts:
+        return
+    if len(pts) == 1:
+        _disc_into(buf, W, H, pts[0][0], pts[0][1], thick / 2.0, rgb)
+        return
+    half = thick / 2.0
+    for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+        dx, dy = x2 - x1, y2 - y1
+        length = math.hypot(dx, dy)
+        if length < 0.001:
+            _disc_into(buf, W, H, x1, y1, half, rgb)
+            continue
+        nx, ny = -dy / length * half, dx / length * half
+        _poly_into(buf, W, H, [
+            (x1 + nx, y1 + ny), (x2 + nx, y2 + ny),
+            (x2 - nx, y2 - ny), (x1 - nx, y1 - ny),
+        ], rgb)
+        _disc_into(buf, W, H, x1, y1, half, rgb)
+        _disc_into(buf, W, H, x2, y2, half, rgb)
+
+
+def _png_bytes(w, h, rgb):
+    """Encode flat RGB bytes as a PNG (filter 0, deterministic)."""
+    stride = w * 3
+    raw = bytearray((stride + 1) * h)
+    for y in range(h):
+        raw[y * (stride + 1)] = 0
+        raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)] = rgb[y * stride:(y + 1) * stride]
+
+    def chunk(typ, data):
+        out = struct.pack(">I", len(data)) + typ + data
+        return out + struct.pack(">I", zlib.crc32(typ + data) & 0xFFFFFFFF)
+
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+        + chunk(b"IEND", b"")
+    )
+
+
+class Raster:
+    """A supersampled RGB canvas in logical coordinates."""
+
+    def __init__(self, w, h, ss=2, bg=(248, 243, 231)):
+        self.w = int(w)
+        self.h = int(h)
+        self.ss = int(ss) if ss else 1
+        self.sw = self.w * self.ss
+        self.sh = self.h * self.ss
+        row = bytes(bg) * self.sw
+        self.buf = bytearray(row * self.sh)
+
+    def _px(self, v):
+        return v * self.ss
+
+    def fill(self, color):
+        row = bytes(color) * self.sw
+        self.buf[:] = row * self.sh
+
+    def box(self, x, y, w, h, color):
+        x0 = int(math.floor(self._px(x)))
+        y0 = int(math.floor(self._px(y)))
+        x1 = int(math.ceil(self._px(x + w)))
+        y1 = int(math.ceil(self._px(y + h)))
+        for yy in range(max(0, y0), min(self.sh, y1)):
+            _hspan(self.buf, self.sw, self.sh, yy, max(0, x0), min(self.sw, x1), color)
+
+    def disc(self, cx, cy, r, color):
+        _disc_into(self.buf, self.sw, self.sh,
+                   self._px(cx), self._px(cy), self._px(r), color)
+
+    def poly(self, points, color):
+        scaled = [(self._px(px), self._px(py)) for px, py in points]
+        _poly_into(self.buf, self.sw, self.sh, scaled, color)
+
+    def seg(self, x1, y1, x2, y2, w, color):
+        thick = max(self._px(w), 1.0)
+        pts = [(self._px(x1), self._px(y1)), (self._px(x2), self._px(y2))]
+        _stroke_into(self.buf, self.sw, self.sh, pts, thick, color)
+
+    def sample(self):
+        """Downsampled RGB bytes (w*h*3), averaging each ss x ss block."""
+        ss = self.ss
+        sw, sh = self.sw, self.sh
+        buf = self.buf
+        out = bytearray(self.w * self.h * 3)
+        if ss == 1:
+            out[:] = buf
+            return bytes(out)
+        for oy in range(self.h):
+            y0 = oy * ss
+            orow = oy * self.w * 3
+            for ox in range(self.w):
+                x0 = ox * ss
+                sr = sg = sb = 0
+                for dy in range(ss):
+                    base = ((y0 + dy) * sw + x0) * 3
+                    for dx in range(ss):
+                        i = base + dx * 3
+                        sr += buf[i]
+                        sg += buf[i + 1]
+                        sb += buf[i + 2]
+                n = ss * ss
+                o = orow + ox * 3
+                out[o] = sr // n
+                out[o + 1] = sg // n
+                out[o + 2] = sb // n
+        return bytes(out)
+
+    def png(self):
+        return _png_bytes(self.w, self.h, self.sample())
+
+# --------------------------------------------------------------------- text
+# One vertical grid unit is size/9 pixels; cap height is 11 units, so a
+# size-S glyph stands about 1.22*S tall with a short descender below the
+# baseline at unit 11. Horizontal units are squeezed by SX.
+_GAP = 0.05          # extra space between neighbours, in units of size
+_LINE_H = 1.28       # default line height, in units of size
+_GLYPH_RUNS = {}     # (char, size, bold, ss) -> ((dy, x0, x1), ...)
+
+
+def _adv_units(ch):
+    entry = PARSED.get(ch)
+    if entry is None:
+        entry = PARSED[_FALLBACK]
+    return entry[0]
+
+
+def _char_advance(ch, size):
+    return _adv_units(ch) * size / 9.0 * SX
 
 
 def measure(s, size, bold=False):
-    """Width in final px of string s at cap-height `size`."""
-    s = _clean(s)
-    scale = size / 14.0
-    w = 0.0
+    """Width in logical pixels of s at the given size (bold is as wide)."""
+    if not s:
+        return 0.0
+    total = 0.0
     for ch in s:
-        adv, _ = PARSED.get(ch, PARSED["?"])
-        w += (adv + 0.9) * scale
-    if s:
-        w -= 0.9 * scale
-    return w * SX
+        total += _char_advance(ch, size)
+    total += max(0, len(s) - 1) * size * _GAP
+    return total
 
 
-def _glyph(raster, ch, x, y_top, size, color, bold):
-    """Draw one glyph; x is the left edge in final px, y_top is cap top."""
-    adv, strokes = PARSED.get(ch, PARSED["?"])
-    scale = size / 14.0
-    sw = (2.7 if bold else 1.8) * scale
-    for stroke in strokes:
-        if len(stroke) == 1:
-            px, py = stroke[0]
-            raster.disc(x + px * scale * SX, y_top + py * scale,
-                        sw / 2.0, color)
-            continue
-        for i in range(len(stroke) - 1):
-            x1, y1 = stroke[i]
-            x2, y2 = stroke[i + 1]
-            raster.seg(x + x1 * scale * SX, y_top + y1 * scale,
-                       x + x2 * scale * SX, y_top + y2 * scale, sw, color)
-    return (adv + 0.9) * scale * SX
-
-
-def put_text(raster, s, x, y_top, size, color, bold=False, align="left"):
-    """Draw text; y_top is the cap-top line. Returns the width drawn."""
-    s = _clean(s)
-    w = measure(s, size, bold)
-    if align == "center":
-        x -= w / 2.0
-    elif align == "right":
-        x -= w
-    cx = x
-    for ch in s:
-        cx += _glyph(raster, ch, cx, y_top, size, color, bold)
-    return w
+def _split_long_word(word, size, max_w, bold=False):
+    """Break one over-wide word into chunks that each fit max_w."""
+    chunks = []
+    cur = ""
+    for ch in word:
+        trial = cur + ch
+        if cur and measure(trial, size, bold) > max_w:
+            chunks.append(cur)
+            cur = ch
+        else:
+            cur = trial
+    if cur:
+        chunks.append(cur)
+    return chunks
 
 
 def wrap(s, size, max_w, bold=False):
-    """Greedy word wrap; returns the list of lines that fit max_w."""
-    words = _clean(s).split(" ")
+    """Greedy word wrap; returns a list of lines (never a trailing blank)."""
+    if not s:
+        return []
     lines = []
-    cur = ""
-    for word in words:
-        trial = (cur + " " + word) if cur else word
-        if measure(trial, size, bold) <= max_w or not cur:
-            cur = trial
+    for word in s.split(" "):
+        if not word:
+            continue
+        if measure(word, size, bold) > max_w:
+            pieces = _split_long_word(word, size, max_w, bold)
+            for piece in pieces:
+                if lines and measure(lines[-1] + " " + piece, size, bold) <= max_w:
+                    lines[-1] = lines[-1] + " " + piece
+                else:
+                    lines.append(piece)
+            continue
+        if lines and measure(lines[-1] + " " + word, size, bold) <= max_w:
+            lines[-1] = lines[-1] + " " + word
         else:
-            lines.append(cur)
-            cur = word
-    if cur:
-        lines.append(cur)
+            lines.append(word)
     return lines
 
 
+def _glyph_runs(ch, size, bold, ss):
+    """Horizontal ink runs of one glyph, in supersampled pixels.
+
+    Returns ((dy, x0, x1), ...) relative to the glyph cell's top-left,
+    where the cell is advance-wide and 14 grid units tall. Cached.
+    """
+    key = (ch, round(float(size), 3), bool(bold), ss)
+    cached = _GLYPH_RUNS.get(key)
+    if cached is not None:
+        return cached
+    adv, strokes = PARSED.get(ch, PARSED[_FALLBACK])
+    scale_v = size / 11.5
+    scale_h = size / 9.0 * SX
+    cell_w = max(1, int(math.ceil(adv * scale_h * ss)) + 2)
+    cell_h = max(1, int(math.ceil(14 * scale_v * ss)) + 2)
+    buf = bytearray(cell_w * cell_h * 3)
+    thick = max(1.0, size * (0.17 if bold else 0.10) * ss)
+    for stroke in strokes:
+        pts = [(gx * scale_h * ss + 1.0, gy * scale_v * ss + 1.0)
+               for gx, gy in stroke]
+        _stroke_into(buf, cell_w, cell_h, pts, thick, (255, 255, 255))
+    runs = []
+    for y in range(cell_h):
+        row = y * cell_w * 3
+        x = 0
+        while x < cell_w:
+            if buf[row + x * 3]:
+                x0 = x
+                while x < cell_w and buf[row + x * 3]:
+                    x += 1
+                runs.append((y, x0, x))
+            else:
+                x += 1
+    runs = tuple(runs)
+    _GLYPH_RUNS[key] = runs
+    return runs
+
+
+def put_text(raster, s, x, y_top, size, color, bold=False, align="left"):
+    """Draw s with its top at y_top; returns the width drawn."""
+    if not s:
+        return 0.0
+    width = measure(s, size, bold)
+    if align == "center":
+        pen = x - width / 2.0
+    elif align == "right":
+        pen = x - width
+    else:
+        pen = x
+    ss = raster.ss
+    y0 = int(round(y_top * ss))
+    gap = size * _GAP
+    for ch in s:
+        if ch == "\n":
+            ch = " "
+        runs = _glyph_runs(ch, size, bold, ss)
+        x0 = int(round(pen * ss))
+        for dy, rx0, rx1 in runs:
+            _hspan(raster.buf, raster.sw, raster.sh, y0 + dy,
+                   x0 + rx0, x0 + rx1, color)
+        pen += _char_advance(ch, size) + gap
+    return width
+
+
 def para(raster, s, x, y_top, size, max_w, color, bold=False, line_h=None):
-    """Draw a wrapped paragraph; returns the y just below the last line."""
+    """Draw a wrapped paragraph; returns the y just below its last line."""
     if line_h is None:
-        line_h = size * 1.28
+        line_h = size * _LINE_H
+    lines = wrap(s, size, max_w, bold)
     y = y_top
-    for line in wrap(s, size, max_w, bold):
+    for line in lines:
         put_text(raster, line, x, y, size, color, bold)
         y += line_h
     return y
 
-# ---------------------------------------------------------------- scenes
-# Flat vector illustrations, defined as ops in normalized 0..1 box coords.
-# op: ("box", x0, y0, x1, y1, color) | ("disc", cx, cy, r, color)
-#     | ("poly", [(x, y)...], color) | ("seg", x1, y1, x2, y2, w, color)
-def paint_scene(raster, kind, x, y, w, h):
-    """Paint a flat scene into box (x, y, w, h) in final px."""
-    scene = SCENES.get(kind, SCENES["generic"])
-    raster.box(x, y, w, h, scene.get("sky", SKY))
-    if "ground" in scene:
-        gy, gc = scene["ground"]
-        raster.box(x, y + h * gy, w, h * (1 - gy), gc)
-    for op in scene["ops"]:
-        t = op[0]
-        if t == "box":
-            _, x0, y0, x1, y1, c = op
-            raster.box(x + x0 * w, y + y0 * h, (x1 - x0) * w, (y1 - y0) * h, c)
-        elif t == "disc":
-            _, cx, cy, r, c = op
-            raster.disc(x + cx * w, y + cy * h, r * w, c)
-        elif t == "poly":
-            _, pts, c = op
-            raster.poly([(x + px * w, y + py * h) for (px, py) in pts], c)
-        elif t == "seg":
-            _, x1, y1, x2, y2, lw, c = op
-            raster.seg(x + x1 * w, y + y1 * h, x + x2 * w, y + y2 * h,
-                       lw * w, c)
+# ------------------------------------------------------------ dotted world
+# A hand-drawn land mask: 60 columns of 6 degrees longitude, 30 rows of 6
+# degrees latitude (row 0 is 84-90N, row 29 is 84-90S). '#' is land.
+# Drawn from memory of the continents' shapes; Antarctica left blank,
+# as on the reference page.
+LAND = (
+    "....................###.....................................",
+    "...............############.................................",
+    ".......########....####................#.....#####..........",
+    "..###############...###.......##.#########################..",
+    "...###############........##.#############################..",
+    "....###############..........#############################..",
+    "...........#########.........############################...",
+    "...........##########.......#############################...",
+    "............#########.......#############################...",
+    ".............#########......###########################.....",
+    ".............#####..#.......#############.#########.........",
+    "..............####.###......#########.###..########.........",
+    "...............###...........########.......#.#######.......",
+    "...............#####..........#######..........#######......",
+    "...............######.........######.............########...",
+    "...............######.........######..............#######...",
+    "...............######.........#####................####.....",
+    "...............#####..........####..#.............######....",
+    "...............#####..........####..#.............#######...",
+    "...............####...........####................######....",
+    "................###...........###..................####..#..",
+    "................##..................................###..#..",
+    "................#........................................#..",
+    "................#...........................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+)
 
-
-SCENES = {
-    "generic": {"sky": SKY, "ops": [
-        ("disc", 0.78, 0.22, 0.12, (255, 214, 120)),
-        ("box", 0.08, 0.62, 0.92, 0.68, (120, 140, 120)),
-        ("box", 0.15, 0.35, 0.35, 0.62, (90, 100, 130)),
-        ("box", 0.45, 0.45, 0.62, 0.62, (70, 80, 110)),
-        ("box", 0.68, 0.30, 0.88, 0.62, (100, 110, 140)),
-    ]},
-    "summit": {"sky": (214, 226, 238), "ops": [
-        ("box", 0, 0.30, 1, 0.36, (120, 90, 60)),
-        ("box", 0.06, 0.36, 0.94, 0.52, (96, 66, 40)),
-        ("box", 0.10, 0.52, 0.90, 0.58, (70, 48, 28)),
-        ("box", 0.42, 0.44, 0.58, 0.50, (255, 255, 255)),
-        ("disc", 0.16, 0.24, 0.05, (200, 120, 80)),
-        ("box", 0.13, 0.28, 0.19, 0.36, (60, 80, 120)),
-        ("disc", 0.34, 0.24, 0.05, (80, 120, 160)),
-        ("box", 0.31, 0.28, 0.37, 0.36, (90, 110, 80)),
-        ("disc", 0.66, 0.24, 0.05, (160, 90, 90)),
-        ("box", 0.63, 0.28, 0.69, 0.36, (120, 100, 60)),
-        ("disc", 0.84, 0.24, 0.05, (90, 140, 110)),
-        ("box", 0.81, 0.28, 0.87, 0.36, (70, 90, 130)),
-        ("box", 0.80, 0.06, 0.94, 0.16, (255, 255, 255)),
-        ("disc", 0.87, 0.11, 0.028, (40, 40, 40)),
-    ]},
-    "city": {"sky": NIGHT, "ops": [
-        ("disc", 0.82, 0.16, 0.07, (240, 230, 180)),
-        ("box", 0.05, 0.40, 0.20, 0.95, (30, 34, 60)),
-        ("box", 0.24, 0.25, 0.42, 0.95, (38, 44, 74)),
-        ("box", 0.46, 0.48, 0.60, 0.95, (28, 32, 56)),
-        ("box", 0.64, 0.32, 0.82, 0.95, (36, 42, 70)),
-        ("box", 0.86, 0.55, 0.97, 0.95, (30, 34, 60)),
-        ("disc", 0.28, 0.10, 0.012, (255, 220, 120)),
-        ("disc", 0.30, 0.14, 0.012, (255, 220, 120)),
-        ("disc", 0.55, 0.08, 0.012, (255, 220, 120)),
-        ("disc", 0.58, 0.12, 0.012, (255, 220, 120)),
-        ("disc", 0.72, 0.10, 0.012, (255, 220, 120)),
-        ("box", 0.27, 0.32, 0.30, 0.36, (255, 220, 120)),
-        ("box", 0.34, 0.40, 0.37, 0.44, (255, 220, 120)),
-        ("box", 0.68, 0.38, 0.71, 0.42, (255, 220, 120)),
-        ("box", 0.75, 0.50, 0.78, 0.54, (255, 220, 120)),
-        ("box", 0.10, 0.50, 0.13, 0.54, (255, 220, 120)),
-    ]},
-    "court": {"sky": (214, 226, 238), "ops": [
-        ("poly", [(0.10, 0.35), (0.50, 0.12), (0.90, 0.35)], (150, 130, 100)),
-        ("box", 0.12, 0.35, 0.88, 0.40, (120, 100, 70)),
-        ("box", 0.16, 0.40, 0.22, 0.90, (230, 225, 210)),
-        ("box", 0.36, 0.40, 0.42, 0.90, (230, 225, 210)),
-        ("box", 0.58, 0.40, 0.64, 0.90, (230, 225, 210)),
-        ("box", 0.78, 0.40, 0.84, 0.90, (230, 225, 210)),
-        ("box", 0.10, 0.90, 0.90, 0.95, (120, 100, 70)),
-        ("box", 0.44, 0.55, 0.56, 0.90, (60, 60, 70)),
-    ]},
-    "chart": {"sky": (232, 238, 244), "ops": [
-        ("seg", 0.10, 0.85, 0.10, 0.15, 0.02, (60, 60, 60)),
-        ("seg", 0.10, 0.85, 0.92, 0.85, 0.02, (60, 60, 60)),
-        ("box", 0.18, 0.55, 0.28, 0.85, (32, 86, 156)),
-        ("box", 0.34, 0.40, 0.44, 0.85, (32, 86, 156)),
-        ("box", 0.50, 0.62, 0.60, 0.85, (170, 28, 24)),
-        ("box", 0.66, 0.30, 0.76, 0.85, (30, 114, 64)),
-        ("seg", 0.14, 0.60, 0.30, 0.42, 0.03, (184, 130, 24)),
-        ("seg", 0.30, 0.42, 0.52, 0.55, 0.03, (184, 130, 24)),
-        ("seg", 0.52, 0.55, 0.88, 0.25, 0.03, (184, 130, 24)),
-        ("disc", 0.88, 0.25, 0.03, (184, 130, 24)),
-    ]},
-    "ship": {"sky": (168, 200, 228), "ground": (0.62, (24, 90, 140)), "ops": [
-        ("poly", [(0.10, 0.62), (0.90, 0.62), (0.82, 0.80), (0.18, 0.80)], (60, 60, 70)),
-        ("box", 0.18, 0.42, 0.34, 0.62, (170, 28, 24)),
-        ("box", 0.36, 0.42, 0.52, 0.62, (32, 86, 156)),
-        ("box", 0.54, 0.42, 0.70, 0.62, (184, 130, 24)),
-        ("box", 0.72, 0.48, 0.82, 0.62, (240, 240, 240)),
-        ("disc", 0.82, 0.28, 0.06, (255, 220, 120)),
-        ("disc", 0.20, 0.30, 0.05, (120, 120, 120)),
-        ("disc", 0.28, 0.26, 0.04, (140, 140, 140)),
-    ]},
-    "tanker": {"sky": (190, 210, 232), "ground": (0.66, (30, 100, 150)), "ops": [
-        ("poly", [(0.06, 0.66), (0.94, 0.66), (0.86, 0.84), (0.14, 0.84)], (40, 40, 50)),
-        ("box", 0.20, 0.50, 0.68, 0.66, (150, 40, 30)),
-        ("box", 0.72, 0.44, 0.84, 0.66, (230, 225, 210)),
-        ("disc", 0.78, 0.40, 0.03, (255, 220, 120)),
-        ("box", 0.30, 0.54, 0.34, 0.66, (255, 255, 255)),
-        ("box", 0.44, 0.54, 0.48, 0.66, (255, 255, 255)),
-        ("box", 0.58, 0.54, 0.62, 0.66, (255, 255, 255)),
-        ("poly", [(0.50, 0.30), (0.46, 0.48), (0.50, 0.40), (0.54, 0.48), (0.58, 0.36), (0.60, 0.48), (0.56, 0.30)], (230, 110, 30)),
-        ("disc", 0.14, 0.24, 0.05, (255, 214, 120)),
-    ]},
-    "drone": {"sky": (206, 222, 238), "ops": [
-        ("disc", 0.50, 0.48, 0.10, (60, 60, 70)),
-        ("disc", 0.50, 0.48, 0.05, (120, 130, 140)),
-        ("seg", 0.28, 0.30, 0.72, 0.66, 0.03, (80, 80, 90)),
-        ("seg", 0.72, 0.30, 0.28, 0.66, 0.03, (80, 80, 90)),
-        ("disc", 0.24, 0.26, 0.09, (200, 200, 210)),
-        ("disc", 0.76, 0.26, 0.09, (200, 200, 210)),
-        ("disc", 0.24, 0.70, 0.09, (200, 200, 210)),
-        ("disc", 0.76, 0.70, 0.09, (200, 200, 210)),
-        ("disc", 0.24, 0.26, 0.035, (40, 40, 50)),
-        ("disc", 0.76, 0.26, 0.035, (40, 40, 50)),
-        ("disc", 0.24, 0.70, 0.035, (40, 40, 50)),
-        ("disc", 0.76, 0.70, 0.035, (40, 40, 50)),
-        ("disc", 0.86, 0.18, 0.04, (255, 200, 60)),
-    ]},
-    "parade": {"sky": (176, 208, 236), "ops": [
-        ("disc", 0.50, 0.34, 0.20, (230, 90, 80)),
-        ("disc", 0.50, 0.34, 0.14, (245, 140, 120)),
-        ("poly", [(0.50, 0.54), (0.44, 0.62), (0.56, 0.62)], (200, 70, 60)),
-        ("seg", 0.50, 0.62, 0.50, 0.80, 0.015, (80, 80, 80)),
-        ("disc", 0.18, 0.22, 0.05, (255, 220, 120)),
-        ("disc", 0.84, 0.18, 0.04, (255, 220, 120)),
-        ("box", 0.08, 0.80, 0.92, 0.88, (90, 100, 120)),
-        ("disc", 0.20, 0.76, 0.05, (60, 80, 120)),
-        ("disc", 0.40, 0.78, 0.05, (160, 90, 90)),
-        ("disc", 0.60, 0.76, 0.05, (90, 110, 80)),
-        ("disc", 0.80, 0.78, 0.05, (120, 100, 60)),
-    ]},
-    "flag": {"sky": (214, 226, 238), "ops": [
-        ("seg", 0.20, 0.10, 0.20, 0.90, 0.025, (60, 60, 60)),
-        ("poly", [(0.20, 0.12), (0.78, 0.20), (0.20, 0.42)], (170, 28, 24)),
-        ("disc", 0.70, 0.70, 0.05, (200, 120, 80)),
-        ("box", 0.67, 0.74, 0.73, 0.90, (60, 80, 120)),
-        ("disc", 0.45, 0.68, 0.05, (80, 120, 160)),
-        ("box", 0.42, 0.72, 0.48, 0.90, (90, 110, 80)),
-    ]},
-    "health": {"sky": (238, 230, 228), "ops": [
-        ("box", 0.12, 0.30, 0.88, 0.90, (240, 240, 240)),
-        ("box", 0.12, 0.30, 0.88, 0.38, (170, 28, 24)),
-        ("box", 0.42, 0.10, 0.50, 0.30, (255, 255, 255)),
-        ("box", 0.44, 0.16, 0.48, 0.34, (170, 28, 24)),
-        ("box", 0.46, 0.14, 0.54, 0.22, (170, 28, 24)),
-        ("box", 0.20, 0.55, 0.26, 0.65, (32, 86, 156)),
-        ("box", 0.34, 0.55, 0.40, 0.65, (32, 86, 156)),
-        ("box", 0.60, 0.55, 0.66, 0.65, (32, 86, 156)),
-        ("box", 0.74, 0.55, 0.80, 0.65, (32, 86, 156)),
-    ]},
-    "energy": {"sky": (224, 232, 240), "ops": [
-        ("poly", [(0.55, 0.08), (0.38, 0.50), (0.52, 0.50), (0.40, 0.92), (0.68, 0.45), (0.54, 0.45)], (255, 200, 40)),
-        ("box", 0.10, 0.70, 0.30, 0.78, (32, 86, 156)),
-        ("box", 0.70, 0.70, 0.90, 0.78, (32, 86, 156)),
-        ("seg", 0.20, 0.78, 0.20, 0.95, 0.02, (60, 60, 60)),
-        ("seg", 0.80, 0.78, 0.80, 0.95, 0.02, (60, 60, 60)),
-    ]},
-    "football": {"sky": (168, 200, 228), "ground": (0.55, (50, 140, 70)), "ops": [
-        ("box", 0.08, 0.30, 0.12, 0.55, (255, 255, 255)),
-        ("box", 0.08, 0.30, 0.45, 0.34, (255, 255, 255)),
-        ("box", 0.41, 0.30, 0.45, 0.55, (255, 255, 255)),
-        ("disc", 0.70, 0.72, 0.06, (255, 255, 255)),
-        ("poly", [(0.70, 0.66), (0.75, 0.70), (0.72, 0.76), (0.66, 0.74), (0.65, 0.69)], (30, 30, 30)),
-        ("seg", 0.10, 0.85, 0.90, 0.85, 0.02, (255, 255, 255)),
-    ]},
-    "election": {"sky": (214, 226, 238), "ops": [
-        ("box", 0.25, 0.45, 0.75, 0.85, (150, 130, 100)),
-        ("box", 0.20, 0.38, 0.80, 0.47, (120, 100, 70)),
-        ("box", 0.44, 0.30, 0.56, 0.38, (255, 255, 255)),
-        ("seg", 0.30, 0.60, 0.42, 0.72, 0.04, (30, 114, 64)),
-        ("seg", 0.42, 0.72, 0.68, 0.48, 0.04, (30, 114, 64)),
-        ("disc", 0.82, 0.22, 0.05, (32, 86, 156)),
-    ]},
-    "space": {"sky": (16, 24, 52), "ops": [
-        ("disc", 0.70, 0.35, 0.16, (200, 120, 80)),
-        ("disc", 0.65, 0.30, 0.05, (220, 150, 100)),
-        ("disc", 0.20, 0.20, 0.015, (255, 255, 255)),
-        ("disc", 0.35, 0.12, 0.012, (255, 255, 255)),
-        ("disc", 0.50, 0.18, 0.015, (255, 255, 255)),
-        ("disc", 0.85, 0.15, 0.012, (255, 255, 255)),
-        ("disc", 0.15, 0.45, 0.012, (255, 255, 255)),
-        ("disc", 0.45, 0.55, 0.012, (255, 255, 255)),
-        ("poly", [(0.30, 0.75), (0.55, 0.70), (0.65, 0.85), (0.40, 0.92)], (120, 120, 130)),
-        ("seg", 0.55, 0.70, 0.75, 0.62, 0.02, (180, 180, 190)),
-    ]},
-    "tech": {"sky": (232, 238, 244), "ops": [
-        ("box", 0.30, 0.28, 0.70, 0.72, (40, 40, 50)),
-        ("box", 0.40, 0.38, 0.60, 0.62, (90, 110, 140)),
-        ("seg", 0.30, 0.38, 0.12, 0.38, 0.025, (80, 80, 80)),
-        ("seg", 0.30, 0.50, 0.12, 0.50, 0.025, (80, 80, 80)),
-        ("seg", 0.30, 0.62, 0.12, 0.62, 0.025, (80, 80, 80)),
-        ("seg", 0.70, 0.38, 0.88, 0.38, 0.025, (80, 80, 80)),
-        ("seg", 0.70, 0.50, 0.88, 0.50, 0.025, (80, 80, 80)),
-        ("seg", 0.70, 0.62, 0.88, 0.62, 0.025, (80, 80, 80)),
-        ("disc", 0.18, 0.22, 0.04, (255, 200, 60)),
-        ("disc", 0.82, 0.80, 0.04, (255, 200, 60)),
-    ]},
-    "market": {"sky": (232, 238, 244), "ops": [
-        ("seg", 0.10, 0.85, 0.10, 0.15, 0.02, (60, 60, 60)),
-        ("seg", 0.10, 0.85, 0.92, 0.85, 0.02, (60, 60, 60)),
-        ("box", 0.20, 0.35, 0.26, 0.55, (30, 114, 64)),
-        ("seg", 0.23, 0.28, 0.23, 0.62, 0.02, (30, 114, 64)),
-        ("box", 0.36, 0.45, 0.42, 0.70, (170, 28, 24)),
-        ("seg", 0.39, 0.38, 0.39, 0.78, 0.02, (170, 28, 24)),
-        ("box", 0.52, 0.30, 0.58, 0.50, (30, 114, 64)),
-        ("seg", 0.55, 0.22, 0.55, 0.58, 0.02, (30, 114, 64)),
-        ("box", 0.68, 0.50, 0.74, 0.75, (170, 28, 24)),
-        ("seg", 0.71, 0.42, 0.71, 0.82, 0.02, (170, 28, 24)),
-        ("disc", 0.85, 0.25, 0.04, (184, 130, 24)),
-    ]},
-    "trophy": {"sky": (238, 230, 200), "ops": [
-        ("poly", [(0.32, 0.15), (0.68, 0.15), (0.62, 0.45), (0.38, 0.45)], (212, 160, 40)),
-        ("seg", 0.32, 0.20, 0.22, 0.32, 0.03, (212, 160, 40)),
-        ("seg", 0.68, 0.20, 0.78, 0.32, 0.03, (212, 160, 40)),
-        ("box", 0.47, 0.45, 0.53, 0.70, (180, 130, 30)),
-        ("box", 0.34, 0.70, 0.66, 0.80, (120, 90, 30)),
-        ("disc", 0.20, 0.25, 0.04, (255, 220, 120)),
-        ("disc", 0.80, 0.20, 0.03, (255, 220, 120)),
-        ("disc", 0.14, 0.55, 0.025, (255, 220, 120)),
-    ]},
-    "fire": {"sky": (240, 220, 200), "ops": [
-        ("box", 0.10, 0.45, 0.40, 0.90, (90, 80, 70)),
-        ("box", 0.55, 0.55, 0.85, 0.90, (110, 95, 80)),
-        ("poly", [(0.50, 0.85), (0.42, 0.55), (0.50, 0.40), (0.58, 0.55), (0.66, 0.42), (0.70, 0.70), (0.62, 0.85)], (230, 110, 30)),
-        ("poly", [(0.52, 0.85), (0.50, 0.65), (0.56, 0.55), (0.60, 0.70), (0.58, 0.85)], (255, 200, 60)),
-        ("disc", 0.82, 0.20, 0.07, (255, 220, 120)),
-    ]},
-    "protest": {"sky": (232, 226, 214), "ops": [
-        ("box", 0.30, 0.18, 0.70, 0.34, (255, 255, 255)),
-        ("seg", 0.50, 0.34, 0.50, 0.60, 0.02, (80, 80, 80)),
-        ("disc", 0.18, 0.55, 0.06, (200, 120, 80)),
-        ("box", 0.14, 0.60, 0.22, 0.90, (60, 80, 120)),
-        ("disc", 0.42, 0.55, 0.06, (80, 120, 160)),
-        ("box", 0.38, 0.60, 0.46, 0.90, (90, 110, 80)),
-        ("disc", 0.66, 0.55, 0.06, (160, 90, 90)),
-        ("box", 0.62, 0.60, 0.70, 0.90, (120, 100, 60)),
-        ("disc", 0.86, 0.55, 0.06, (90, 140, 110)),
-        ("box", 0.82, 0.60, 0.90, 0.90, (70, 90, 130)),
-    ]},
-    "education": {"sky": (224, 232, 240), "ops": [
-        ("poly", [(0.12, 0.75), (0.50, 0.55), (0.50, 0.78), (0.12, 0.92)], (32, 86, 156)),
-        ("poly", [(0.88, 0.75), (0.50, 0.55), (0.50, 0.78), (0.88, 0.92)], (28, 70, 130)),
-        ("poly", [(0.20, 0.30), (0.50, 0.14), (0.80, 0.30), (0.50, 0.46)], (40, 40, 50)),
-        ("box", 0.46, 0.44, 0.54, 0.62, (40, 40, 50)),
-        ("disc", 0.78, 0.48, 0.03, (184, 130, 24)),
-    ]},
-    "cricket": {"sky": (168, 200, 228), "ground": (0.55, (60, 150, 80)), "ops": [
-        ("box", 0.15, 0.60, 0.85, 0.68, (224, 200, 150)),
-        ("box", 0.20, 0.45, 0.23, 0.60, (220, 180, 60)),
-        ("box", 0.24, 0.45, 0.27, 0.60, (220, 180, 60)),
-        ("box", 0.28, 0.45, 0.31, 0.60, (220, 180, 60)),
-        ("disc", 0.70, 0.35, 0.05, (170, 28, 24)),
-        ("seg", 0.55, 0.40, 0.72, 0.55, 0.03, (120, 90, 60)),
-        ("seg", 0.72, 0.55, 0.68, 0.75, 0.03, (120, 90, 60)),
-    ]},
-    "radar": {"sky": (206, 222, 238), "ops": [
-        ("box", 0.05, 0.70, 0.30, 0.95, (90, 100, 110)),
-        ("box", 0.06, 0.62, 0.29, 0.70, (120, 130, 140)),
-        ("disc", 0.68, 0.42, 0.20, (240, 240, 240)),
-        ("poly", [(0.68, 0.42), (0.86, 0.28), (0.90, 0.34), (0.68, 0.46)], (180, 60, 50)),
-        ("seg", 0.68, 0.42, 0.50, 0.60, 0.03, (60, 60, 60)),
-        ("seg", 0.68, 0.42, 0.86, 0.60, 0.03, (60, 60, 60)),
-        ("box", 0.66, 0.60, 0.70, 0.95, (70, 70, 70)),
-        ("disc", 0.30, 0.30, 0.05, (255, 200, 60)),
-        ("disc", 0.45, 0.22, 0.04, (255, 200, 60)),
-    ]},
-}
-
-# ---------------------------------------------------------------- dotted map
-# Continent outlines in (lon, lat). The map is drawn by sampling a grid
-# over the box and dotting every cell centre that falls inside a polygon
-# (ray-casting point-in-polygon). Antarctica is left out on purpose.
+# Coarse continent outlines in (lon, lat) pairs, for callers that want
+# polygons instead of the dot grid. Rough on purpose; the dots carry the
+# map, these are only a fallback shape.
 CONTINENTS = [
-    # North America
-    [(-168, 66), (-140, 70), (-125, 72), (-110, 73), (-95, 80), (-85, 80),
-     (-75, 72), (-65, 60), (-55, 52), (-60, 46), (-70, 42), (-75, 35),
-     (-80, 26), (-84, 30), (-90, 21), (-97, 16), (-94, 17), (-86, 13),
-     (-83, 9), (-79, 9), (-92, 15), (-105, 20), (-110, 23), (-117, 33),
-     (-125, 40), (-124, 48), (-135, 58), (-150, 60), (-165, 60)],
-    # Greenland
-    [(-58, 64), (-45, 60), (-40, 70), (-55, 75), (-65, 72)],
-    # South America
-    [(-79, 9), (-77, 4), (-80, -3), (-81, -6), (-77, -12), (-72, -18),
-     (-70, -23), (-70, -30), (-72, -37), (-73, -44), (-70, -52), (-66, -55),
-     (-68, -50), (-62, -42), (-58, -35), (-50, -30), (-41, -23), (-35, -9),
-     (-40, -3), (-44, 0), (-50, 4), (-55, 6), (-62, 9), (-70, 11), (-75, 10)],
-    # Africa
-    [(-17, 15), (-16, 20), (-10, 28), (-6, 33), (0, 36), (10, 37),
-     (20, 32), (30, 31), (32, 31), (35, 28), (38, 22), (40, 15), (43, 12),
-     (48, 11), (51, 10), (45, 2), (41, -2), (40, -10), (36, -18), (33, -26),
-     (28, -33), (20, -35), (17, -29), (14, -22), (12, -12), (12, 0),
-     (9, 4), (6, 4), (-8, 5), (-13, 8), (-17, 12)],
-    # Eurasia (Europe + Asia in one outline)
-    [(-10, 36), (-9, 43), (-2, 44), (-1, 46), (-4, 48), (0, 50), (3, 52),
-     (8, 54), (10, 57), (12, 55), (18, 56), (21, 55), (24, 58), (28, 60),
-     (30, 62), (32, 66), (40, 68), (55, 68), (68, 73), (75, 73), (85, 75),
-     (100, 77), (110, 74), (130, 72), (150, 70), (170, 67), (178, 65),
-     (170, 60), (162, 56), (158, 52), (150, 59), (142, 55), (140, 45),
-     (135, 43), (130, 38), (127, 35), (122, 32), (120, 28), (112, 22),
-     (108, 18), (105, 10), (100, 8), (98, 12), (94, 17), (90, 22), (86, 20),
-     (80, 15), (77, 8), (75, 15), (72, 20), (68, 23), (62, 25), (57, 26),
-     (54, 26), (52, 28), (50, 30), (48, 30), (44, 29), (40, 30), (36, 36),
-     (30, 36), (26, 38), (23, 36), (19, 40), (15, 44), (12, 44), (8, 44),
-     (3, 42), (0, 38), (-2, 37), (-6, 36), (-9, 37)],
-    # United Kingdom
-    [(-5, 50), (-3, 53), (-5, 56), (-2, 58), (0, 53), (1, 51)],
-    # Japan
+    [(-168, 66), (-140, 70), (-125, 72), (-110, 68), (-95, 69), (-85, 66),
+     (-80, 62), (-76, 58), (-70, 45), (-75, 35), (-80, 26), (-85, 20),
+     (-90, 15), (-95, 18), (-105, 22), (-115, 28), (-125, 40), (-125, 48),
+     (-135, 58), (-150, 60), (-165, 60)],
+    [(-58, 64), (-45, 60), (-32, 68), (-22, 70), (-30, 76), (-45, 80),
+     (-58, 76), (-60, 70)],
+    [(-80, 10), (-75, 5), (-70, -5), (-60, -10), (-50, -5), (-40, -10),
+     (-35, -15), (-40, -25), (-48, -28), (-55, -35), (-60, -40),
+     (-65, -45), (-68, -52), (-70, -45), (-72, -35), (-72, -20),
+     (-78, -10), (-80, 0)],
+    [(-10, 36), (-9, 43), (-2, 48), (0, 50), (5, 53), (8, 57), (12, 55),
+     (18, 56), (21, 59), (24, 60), (28, 62), (30, 70), (25, 71), (18, 69),
+     (12, 66), (5, 60), (-2, 57), (-5, 50), (-8, 43), (-10, 38)],
+    [(-17, 15), (-10, 30), (0, 35), (10, 37), (20, 32), (30, 31),
+     (35, 28), (40, 15), (43, 11), (48, 10), (51, 10), (48, 0), (42, -5),
+     (40, -15), (35, -25), (32, -30), (28, -34), (20, -35), (15, -30),
+     (12, -18), (12, -5), (8, 4), (-8, 5), (-15, 11)],
+    [(35, 36), (43, 38), (48, 30), (50, 26), (55, 25), (58, 22), (55, 17),
+     (48, 15), (43, 12), (40, 20), (35, 28)],
+    [(30, 70), (50, 72), (70, 72), (90, 75), (110, 73), (130, 72),
+     (150, 70), (170, 67), (178, 65), (170, 60), (160, 60), (150, 60),
+     (140, 55), (130, 50), (120, 50), (110, 50), (100, 50), (90, 50),
+     (80, 50), (70, 52), (60, 55), (50, 60), (40, 65), (35, 68)],
+    [(68, 23), (72, 20), (76, 8), (80, 10), (80, 18), (85, 20), (88, 22),
+     (90, 24), (88, 26), (80, 28), (75, 27), (70, 25)],
+    [(98, 16), (100, 8), (103, 2), (105, -2), (108, -5), (112, -7),
+     (115, -8), (118, -10), (120, -5), (122, 0), (125, 2), (128, 0),
+     (130, -2), (132, -4), (135, -5), (138, -8), (141, -8), (140, -2),
+     (138, 2), (135, 5), (132, 8), (130, 10), (128, 12), (125, 15),
+     (122, 18), (120, 20), (118, 22), (115, 20), (112, 18), (108, 16),
+     (105, 15), (102, 14), (100, 16)],
+    [(113, -22), (114, -30), (115, -35), (120, -34), (125, -32),
+     (130, -32), (135, -35), (140, -38), (145, -38), (150, -37),
+     (153, -32), (153, -27), (150, -22), (146, -19), (142, -15),
+     (140, -12), (136, -12), (132, -11), (128, -14), (124, -16),
+     (120, -20), (116, -20)],
+    [(166, -34), (168, -38), (170, -42), (172, -44), (174, -41),
+     (176, -38), (174, -36), (170, -35)],
     [(130, 31), (132, 33), (135, 34), (137, 35), (139, 35), (140, 38),
-     (141, 41), (143, 44), (145, 44), (142, 42), (140, 39), (137, 37),
-     (133, 35), (131, 33)],
-    # Borneo
-    [(109, 1), (113, 4), (117, 6), (119, 0), (117, -3), (113, -3), (110, -2)],
-    # Sumatra
-    [(95, 5), (98, 3), (101, 0), (104, -3), (106, -6), (104, -5),
-     (100, 0), (97, 4)],
-    # New Guinea
-    [(131, -1), (136, -2), (141, -3), (146, -6), (150, -9), (147, -8),
-     (141, -8), (136, -6), (132, -3)],
-    # Madagascar
-    [(-49, -13), (-50, -16), (-47, -22), (-44, -25), (-43, -20), (-45, -15),
-     (-48, -12)],
-    # Australia
-    [(113, -22), (114, -30), (115, -33), (118, -35), (124, -33), (130, -32),
-     (135, -35), (140, -38), (145, -38), (150, -37), (153, -32), (153, -27),
-     (150, -22), (146, -19), (142, -15), (142, -11), (137, -12), (135, -15),
-     (132, -12), (130, -13), (126, -14), (122, -17), (118, -20)],
+     (141, 41), (142, 44), (140, 45), (138, 42), (136, 38), (133, 35),
+     (131, 33)],
 ]
 
 
-def _inside_poly(lon, lat, poly):
-    """Ray-casting point-in-polygon test for one outline."""
-    inside = False
-    n = len(poly)
-    j = n - 1
-    for i in range(n):
-        xi, yi = poly[i]
-        xj, yj = poly[j]
-        if (yi > lat) != (yj > lat):
-            xint = xi + (lat - yi) * (xj - xi) / (yj - yi)
-            if lon < xint:
-                inside = not inside
-        j = i
-    return inside
-
-
-def _on_land(lon, lat):
-    for poly in CONTINENTS:
-        if _inside_poly(lon, lat, poly):
-            return True
-    return False
-
-
 def _lonlat(lon, lat, x, y, w, h):
-    """Convert lon/lat to final-px coords inside map box (x, y, w, h)."""
-    mx = x + (lon + 180.0) / 360.0 * w
-    my = y + (75.0 - lat) / 130.0 * h
-    return mx, my
+    """Equirectangular projection of one lon/lat into a map rectangle."""
+    px = x + (lon + 180.0) / 360.0 * w
+    py = y + (90.0 - lat) / 180.0 * h
+    return px, py
 
 
-def paint_map(raster, x, y, w, h, pins,
-             dot_color=(70, 80, 100), pin_color=(170, 28, 24)):
-    """Dotted world map with numbered pins. pins: list of (n, lon, lat)."""
-    cols = 72
-    rows = 26
-    cw = w / cols
-    ch = h / rows
-    dot_r = min(cw, ch) * 0.42
+def paint_map(raster, x, y, w, h, pins, dot_color=(70, 80, 100),
+              pin_color=(170, 28, 24)):
+    """Dot the land grid, then drop numbered pins at their true places.
+
+    pins is a list of (n, lon, lat) tuples (dicts with lat/lon/n also
+    work). Pin numbers are drawn in white, centred on their disc.
+    """
+    cols = len(LAND[0])
+    rows = len(LAND)
+    step_x = w / float(cols)
+    step_y = h / float(rows)
+    step = min(step_x, step_y)
+    dot_r = max(1.2, step * 0.36)
     for r in range(rows):
-        lat = 75.0 - (r + 0.5) * 130.0 / rows
+        line = LAND[r]
+        cy = y + (r + 0.5) * step_y
         for c in range(cols):
-            lon = -180.0 + (c + 0.5) * 360.0 / cols
-            if _on_land(lon, lat):
-                raster.disc(x + (c + 0.5) * cw, y + (r + 0.5) * ch,
-                            dot_r, dot_color)
-    for (n, lon, lat) in pins:
+            if line[c] == "#":
+                cx = x + (c + 0.5) * step_x
+                raster.disc(cx, cy, dot_r, dot_color)
+    pin_r = max(4.0, w * 0.032)
+    for pin in pins or []:
+        if isinstance(pin, dict):
+            lat, lon, n = pin.get("lat"), pin.get("lon"), pin.get("n")
+        else:
+            n, lon, lat = pin[0], pin[1], pin[2]
         px, py = _lonlat(lon, lat, x, y, w, h)
-        raster.disc(px, py, 8.5, pin_color)
-        raster.disc(px, py, 8.5, WHITE)
-        raster.disc(px, py, 7.0, pin_color)
-        put_text(raster, str(n), px, py - 4.5, 9, WHITE, bold=True,
-                 align="center")
+        raster.disc(px, py, pin_r, pin_color)
+        label = str(n)
+        size = pin_r * 1.1
+        put_text(raster, label, px, py - size * 0.48, size, WHITE,
+                 bold=True, align="center")
+
+# ------------------------------------------------------------------- scenes
+# Every scene is drawn from fractions of its own rectangle, so the same
+# painter works for a wide lead strip and a small card strip. Skies are
+# flat, shapes are few and bold, nothing photographic.
+
+SCENES = {
+    "tanker": {"sky": SKY, "ground": TEAL, "motif": "ship"},
+    "drone": {"sky": NIGHT, "ground": NIGHT, "motif": "quad"},
+    "parade": {"sky": SAND, "ground": PALE2, "motif": "balloon"},
+    "city": {"sky": TEAL, "ground": NIGHT, "motif": "towers"},
+    "energy": {"sky": PALE, "ground": SAND, "motif": "refinery"},
+    "chart": {"sky": PAPER, "ground": PAPER, "motif": "bars"},
+    "flag": {"sky": SKY, "ground": GREEN, "motif": "banner"},
+    "generic": {"sky": SKY, "ground": TEAL, "motif": "globe"},
+    "court": {"sky": SKY, "ground": SAND, "motif": "columns"},
+    "ship": {"sky": SKY, "ground": TEAL, "motif": "freighter"},
+    "cricket": {"sky": SKY, "ground": GREEN, "motif": "bat"},
+    "education": {"sky": SKY, "ground": SAND, "motif": "book"},
+    "election": {"sky": SKY, "ground": PALE2, "motif": "ballot"},
+    "fire": {"sky": NIGHT, "ground": NIGHT, "motif": "flame"},
+    "health": {"sky": WHITE, "ground": PALE, "motif": "cross"},
+    "market": {"sky": SKY, "ground": SAND, "motif": "stall"},
+    "protest": {"sky": SKY, "ground": PALE2, "motif": "placards"},
+    "radar": {"sky": NIGHT, "ground": NIGHT, "motif": "sweep"},
+    "space": {"sky": NIGHT, "ground": NIGHT, "motif": "rocket"},
+    "summit": {"sky": SKY, "ground": SAND, "motif": "peaks"},
+    "tech": {"sky": NIGHT, "ground": NIGHT, "motif": "chip"},
+    "trophy": {"sky": SKY, "ground": SAND, "motif": "cup"},
+    "football": {"sky": SKY, "ground": GREEN, "motif": "ball"},
+}
+
+
+def _fx(x, w, f):
+    return x + f * w
+
+
+def _fy(y, h, f):
+    return y + f * h
+
+
+def _rbox(r, x, y, w, h, fx0, fy0, fx1, fy1, color):
+    r.box(_fx(x, w, fx0), _fy(y, h, fy0),
+          (fx1 - fx0) * w, (fy1 - fy0) * h, color)
+
+
+def _rdisc(r, x, y, w, h, fx, fy, fr, color):
+    r.disc(_fx(x, w, fx), _fy(y, h, fy), fr * min(w, h), color)
+
+
+def _rseg(r, x, y, w, h, fx0, fy0, fx1, fy1, fw, color):
+    r.seg(_fx(x, w, fx0), _fy(y, h, fy0), _fx(x, w, fx1), _fy(y, h, fy1),
+          fw * min(w, h), color)
+
+
+def _rpoly(r, x, y, w, h, fracs, color):
+    r.poly([(_fx(x, w, fx), _fy(y, h, fy)) for fx, fy in fracs], color)
+
+
+def _stars(r, x, y, w, h, n=8):
+    # Fixed pseudo-random starfield (seeded by position, deterministic).
+    for i in range(n):
+        fx = ((i * 37 + 11) % 97) / 100.0
+        fy = ((i * 53 + 7) % 61) / 100.0
+        _rdisc(r, x, y, w, h, fx, fy, 0.012, WHITE)
+
+
+def _scene_tanker(r, x, y, w, h):
+    r.box(x, y, w, h, SKY)
+    _rdisc(r, x, y, w, h, 0.82, 0.22, 0.09, GOLD)
+    r.box(x, _fy(y, h, 0.68), w, h * 0.32, TEAL)
+    _rseg(r, x, y, w, h, 0.05, 0.72, 0.95, 0.72, 0.03, WHITE)
+    _rbox(r, x, y, w, h, 0.12, 0.42, 0.88, 0.68, (150, 40, 30))
+    _rbox(r, x, y, w, h, 0.16, 0.30, 0.34, 0.42, (200, 90, 40))
+    _rbox(r, x, y, w, h, 0.38, 0.30, 0.56, 0.42, GOLD)
+    _rbox(r, x, y, w, h, 0.60, 0.30, 0.78, 0.42, (90, 130, 60))
+    _rdisc(r, x, y, w, h, 0.30, 0.24, 0.05, (200, 200, 200))
+    _rdisc(r, x, y, w, h, 0.42, 0.16, 0.04, (220, 220, 220))
+
+
+def _scene_drone(r, x, y, w, h):
+    r.box(x, y, w, h, NIGHT)
+    _stars(r, x, y, w, h, 10)
+    _rdisc(r, x, y, w, h, 0.85, 0.20, 0.07, (230, 225, 200))
+    _rseg(r, x, y, w, h, 0.30, 0.35, 0.70, 0.65, 0.05, (120, 125, 140))
+    _rseg(r, x, y, w, h, 0.70, 0.35, 0.30, 0.65, 0.05, (120, 125, 140))
+    _rdisc(r, x, y, w, h, 0.50, 0.50, 0.11, (60, 65, 80))
+    _rdisc(r, x, y, w, h, 0.50, 0.50, 0.05, RED)
+    for fx, fy in ((0.28, 0.33), (0.72, 0.33), (0.28, 0.67), (0.72, 0.67)):
+        _rdisc(r, x, y, w, h, fx, fy, 0.06, (160, 165, 180))
+    _rdisc(r, x, y, w, h, 0.50, 0.82, 0.05, GOLD)
+
+
+def _scene_parade(r, x, y, w, h):
+    r.box(x, y, w, h, SKY)
+    r.box(x, _fy(y, h, 0.72), w, h * 0.28, (90, 90, 100))
+    _rseg(r, x, y, w, h, 0.05, 0.72, 0.95, 0.72, 0.02, WHITE)
+    _rdisc(r, x, y, w, h, 0.30, 0.38, 0.20, RED)
+    _rdisc(r, x, y, w, h, 0.30, 0.42, 0.16, (200, 60, 50))
+    _rbox(r, x, y, w, h, 0.26, 0.60, 0.34, 0.70, SAND)
+    _rdisc(r, x, y, w, h, 0.68, 0.30, 0.10, GOLD)
+    _rdisc(r, x, y, w, h, 0.82, 0.45, 0.07, BLUE)
+    for fx, fy in ((0.12, 0.18), (0.55, 0.14), (0.90, 0.20), (0.48, 0.60)):
+        _rdisc(r, x, y, w, h, fx, fy, 0.025, (200, 80, 40))
+
+
+def _scene_city(r, x, y, w, h):
+    r.box(x, y, w, h, (28, 40, 80))
+    _rdisc(r, x, y, w, h, 0.85, 0.20, 0.08, (230, 225, 200))
+    _rbox(r, x, y, w, h, 0.06, 0.45, 0.22, 1.0, NIGHT)
+    _rbox(r, x, y, w, h, 0.26, 0.30, 0.44, 1.0, (35, 38, 60))
+    _rbox(r, x, y, w, h, 0.48, 0.55, 0.62, 1.0, NIGHT)
+    _rbox(r, x, y, w, h, 0.66, 0.35, 0.86, 1.0, (35, 38, 60))
+    _rbox(r, x, y, w, h, 0.88, 0.60, 0.98, 1.0, NIGHT)
+    for fx, fy in ((0.12, 0.55), (0.32, 0.42), (0.55, 0.65), (0.74, 0.48),
+                   (0.36, 0.62), (0.80, 0.55), (0.16, 0.78)):
+        _rdisc(r, x, y, w, h, fx, fy, 0.022, GOLD)
+
+
+def _scene_energy(r, x, y, w, h):
+    r.box(x, y, w, h, PALE)
+    _rdisc(r, x, y, w, h, 0.82, 0.22, 0.09, GOLD)
+    _rbox(r, x, y, w, h, 0.10, 0.55, 0.22, 1.0, (90, 90, 100))
+    _rbox(r, x, y, w, h, 0.26, 0.40, 0.36, 1.0, (70, 70, 85))
+    _rbox(r, x, y, w, h, 0.40, 0.60, 0.62, 1.0, (90, 90, 100))
+    _rbox(r, x, y, w, h, 0.66, 0.45, 0.78, 1.0, (70, 70, 85))
+    _rpoly(r, x, y, w, h, [(0.30, 0.40), (0.33, 0.22), (0.36, 0.40)], RED)
+    _rdisc(r, x, y, w, h, 0.33, 0.18, 0.05, GOLD)
+    _rseg(r, x, y, w, h, 0.10, 0.78, 0.90, 0.78, 0.04, TEAL)
+
+
+def _scene_chart(r, x, y, w, h):
+    r.box(x, y, w, h, PAPER)
+    _rseg(r, x, y, w, h, 0.10, 0.85, 0.90, 0.85, 0.03, INK)
+    _rseg(r, x, y, w, h, 0.10, 0.85, 0.10, 0.12, 0.03, INK)
+    _rbox(r, x, y, w, h, 0.16, 0.55, 0.26, 0.85, BLUE)
+    _rbox(r, x, y, w, h, 0.30, 0.42, 0.40, 0.85, GREEN)
+    _rbox(r, x, y, w, h, 0.44, 0.62, 0.54, 0.85, RED)
+    _rbox(r, x, y, w, h, 0.58, 0.30, 0.68, 0.85, GOLD)
+    _rbox(r, x, y, w, h, 0.72, 0.48, 0.82, 0.85, TEAL)
+    _rseg(r, x, y, w, h, 0.14, 0.70, 0.32, 0.50, 0.04, NAVY)
+    _rseg(r, x, y, w, h, 0.32, 0.50, 0.50, 0.58, 0.04, NAVY)
+    _rseg(r, x, y, w, h, 0.50, 0.58, 0.68, 0.30, 0.04, NAVY)
+    _rseg(r, x, y, w, h, 0.68, 0.30, 0.86, 0.18, 0.04, NAVY)
+    _rdisc(r, x, y, w, h, 0.86, 0.18, 0.05, NAVY)
+
+
+def _scene_flag(r, x, y, w, h):
+    r.box(x, y, w, h, SKY)
+    r.box(x, _fy(y, h, 0.78), w, h * 0.22, GREEN)
+    _rseg(r, x, y, w, h, 0.18, 0.12, 0.18, 0.85, 0.03, INK)
+    _rpoly(r, x, y, w, h, [(0.18, 0.14), (0.78, 0.14), (0.62, 0.30),
+                           (0.78, 0.46), (0.18, 0.46)], RED)
+    _rdisc(r, x, y, w, h, 0.82, 0.24, 0.08, GOLD)
+
+
+def _scene_generic(r, x, y, w, h):
+    r.box(x, y, w, h, SKY)
+    _stars(r, x, y, w, h, 6)
+    _rdisc(r, x, y, w, h, 0.50, 0.52, 0.30, TEAL)
+    _rdisc(r, x, y, w, h, 0.42, 0.42, 0.08, GREEN)
+    _rdisc(r, x, y, w, h, 0.60, 0.60, 0.10, GREEN)
+    _rdisc(r, x, y, w, h, 0.58, 0.38, 0.05, SAND)
+    _rseg(r, x, y, w, h, 0.20, 0.52, 0.80, 0.52, 0.02, WHITE)
+
+
+def _scene_court(r, x, y, w, h):
+    r.box(x, y, w, h, SKY)
+    r.box(x, _fy(y, h, 0.80), w, h * 0.20, SAND)
+    _rpoly(r, x, y, w, h, [(0.12, 0.42), (0.50, 0.14), (0.88, 0.42)], PALE2)
+    _rbox(r, x, y, w, h, 0.12, 0.42, 0.88, 0.48, INK)
+    for fx in (0.20, 0.38, 0.56, 0.74):
+        _rbox(r, x, y, w, h, fx, 0.48, fx + 0.07, 0.80, WHITE)
+    _rbox(r, x, y, w, h, 0.08, 0.80, 0.92, 0.86, WHITE)
+
+
+def _scene_ship(r, x, y, w, h):
+    r.box(x, y, w, h, SKY)
+    _rdisc(r, x, y, w, h, 0.15, 0.20, 0.08, GOLD)
+    r.box(x, _fy(y, h, 0.66), w, h * 0.34, TEAL)
+    _rpoly(r, x, y, w, h, [(0.10, 0.55), (0.90, 0.55), (0.82, 0.72),
+                           (0.18, 0.72)], (40, 45, 70))
+    _rbox(r, x, y, w, h, 0.20, 0.38, 0.36, 0.55, RED)
+    _rbox(r, x, y, w, h, 0.38, 0.38, 0.54, 0.55, BLUE)
+    _rbox(r, x, y, w, h, 0.56, 0.38, 0.72, 0.55, GOLD)
+    _rbox(r, x, y, w, h, 0.74, 0.30, 0.82, 0.55, WHITE)
+    _rseg(r, x, y, w, h, 0.06, 0.80, 0.94, 0.80, 0.03, WHITE)
+
+
+def _scene_cricket(r, x, y, w, h):
+    r.box(x, y, w, h, SKY)
+    r.box(x, _fy(y, h, 0.62), w, h * 0.38, GREEN)
+    _rbox(r, x, y, w, h, 0.30, 0.62, 0.70, 0.85, SAND)
+    _rseg(r, x, y, w, h, 0.42, 0.20, 0.58, 0.55, 0.05, (150, 110, 60))
+    _rdisc(r, x, y, w, h, 0.78, 0.30, 0.05, RED)
+    _rbox(r, x, y, w, h, 0.46, 0.72, 0.54, 0.85, WHITE)
+
+
+def _scene_education(r, x, y, w, h):
+    r.box(x, y, w, h, SKY)
+    _rpoly(r, x, y, w, h, [(0.15, 0.40), (0.50, 0.28), (0.85, 0.40),
+                           (0.85, 0.72), (0.50, 0.60), (0.15, 0.72)], WHITE)
+    _rseg(r, x, y, w, h, 0.50, 0.28, 0.50, 0.60, 0.03, INK)
+    _rpoly(r, x, y, w, h, [(0.30, 0.18), (0.70, 0.18), (0.50, 0.30)], NIGHT)
+    _rseg(r, x, y, w, h, 0.70, 0.18, 0.70, 0.42, 0.03, NIGHT)
+    _rdisc(r, x, y, w, h, 0.70, 0.48, 0.04, GOLD)
+
+
+def _scene_election(r, x, y, w, h):
+    r.box(x, y, w, h, SKY)
+    r.box(x, _fy(y, h, 0.75), w, h * 0.25, PALE2)
+    _rbox(r, x, y, w, h, 0.30, 0.42, 0.70, 0.80, NAVY)
+    _rbox(r, x, y, w, h, 0.40, 0.38, 0.60, 0.44, INK)
+    _rpoly(r, x, y, w, h, [(0.44, 0.38), (0.56, 0.38), (0.52, 0.20),
+                           (0.40, 0.20)], WHITE)
+    _rseg(r, x, y, w, h, 0.44, 0.30, 0.52, 0.24, 0.03, RED)
+
+
+def _scene_fire(r, x, y, w, h):
+    r.box(x, y, w, h, NIGHT)
+    _rdisc(r, x, y, w, h, 0.50, 0.62, 0.26, (200, 60, 30))
+    _rdisc(r, x, y, w, h, 0.50, 0.68, 0.18, GOLD)
+    _rpoly(r, x, y, w, h, [(0.50, 0.18), (0.62, 0.45), (0.58, 0.66),
+                           (0.42, 0.66), (0.38, 0.45)], (240, 180, 60))
+    _rdisc(r, x, y, w, h, 0.50, 0.72, 0.06, WHITE)
+
+
+def _scene_health(r, x, y, w, h):
+    r.box(x, y, w, h, WHITE)
+    _rbox(r, x, y, w, h, 0.42, 0.18, 0.58, 0.82, RED)
+    _rbox(r, x, y, w, h, 0.20, 0.40, 0.80, 0.60, RED)
+    _rseg(r, x, y, w, h, 0.08, 0.88, 0.92, 0.88, 0.02, TEAL)
+
+
+def _scene_market(r, x, y, w, h):
+    r.box(x, y, w, h, SKY)
+    _rpoly(r, x, y, w, h, [(0.10, 0.30), (0.90, 0.30), (0.80, 0.50),
+                           (0.20, 0.50)], RED)
+    _rbox(r, x, y, w, h, 0.10, 0.30, 0.28, 0.50, WHITE)
+    _rbox(r, x, y, w, h, 0.46, 0.30, 0.64, 0.50, WHITE)
+    _rbox(r, x, y, w, h, 0.82, 0.30, 0.90, 0.50, WHITE)
+    _rbox(r, x, y, w, h, 0.18, 0.50, 0.82, 0.85, (120, 80, 40))
+    for fx, col in ((0.28, RED), (0.42, GOLD), (0.56, GREEN), (0.70, RED)):
+        _rdisc(r, x, y, w, h, fx, 0.62, 0.05, col)
+
+
+def _scene_protest(r, x, y, w, h):
+    r.box(x, y, w, h, SKY)
+    r.box(x, _fy(y, h, 0.78), w, h * 0.22, PALE2)
+    for fx, col in ((0.18, RED), (0.42, BLUE), (0.66, GOLD), (0.86, GREEN)):
+        _rseg(r, x, y, w, h, fx, 0.30, fx, 0.78, 0.03, INK)
+        _rbox(r, x, y, w, h, fx - 0.09, 0.14, fx + 0.09, 0.32, col)
+    _rdisc(r, x, y, w, h, 0.50, 0.60, 0.06, INK)
+
+
+def _scene_radar(r, x, y, w, h):
+    r.box(x, y, w, h, NIGHT)
+    cx, cy = 0.50, 0.52
+    for fr in (0.12, 0.22, 0.32):
+        pts = []
+        for k in range(25):
+            a = 2 * math.pi * k / 24.0
+            pts.append((_fx(x, w, cx + fr * math.cos(a) * 1.4),
+                        _fy(y, h, cy + fr * math.sin(a))))
+        for p0, p1 in zip(pts, pts[1:] + pts[:1]):
+            r.seg(p0[0], p0[1], p1[0], p1[1], 0.015 * min(w, h), GREEN)
+    _rseg(r, x, y, w, h, cx, cy, 0.82, 0.30, 0.03, GREEN)
+    _rdisc(r, x, y, w, h, cx, cy, 0.04, GREEN)
+    _rdisc(r, x, y, w, h, 0.68, 0.38, 0.04, RED)
+
+
+def _scene_space(r, x, y, w, h):
+    r.box(x, y, w, h, NIGHT)
+    _stars(r, x, y, w, h, 12)
+    _rpoly(r, x, y, w, h, [(0.46, 0.20), (0.54, 0.20), (0.58, 0.55),
+                           (0.42, 0.55)], WHITE)
+    _rpoly(r, x, y, w, h, [(0.46, 0.20), (0.54, 0.20), (0.50, 0.08)], RED)
+    _rpoly(r, x, y, w, h, [(0.42, 0.55), (0.50, 0.72), (0.58, 0.55)], GOLD)
+    _rdisc(r, x, y, w, h, 0.50, 0.42, 0.04, TEAL)
+
+
+def _scene_summit(r, x, y, w, h):
+    r.box(x, y, w, h, SKY)
+    _rdisc(r, x, y, w, h, 0.82, 0.20, 0.09, GOLD)
+    _rpoly(r, x, y, w, h, [(0.02, 0.95), (0.30, 0.30), (0.58, 0.95)], (90, 110, 130))
+    _rpoly(r, x, y, w, h, [(0.40, 0.95), (0.68, 0.18), (0.96, 0.95)], (70, 90, 110))
+    _rpoly(r, x, y, w, h, [(0.68, 0.18), (0.62, 0.32), (0.74, 0.32)], WHITE)
+    _rseg(r, x, y, w, h, 0.68, 0.18, 0.68, 0.06, 0.02, INK)
+    _rpoly(r, x, y, w, h, [(0.68, 0.06), (0.80, 0.10), (0.68, 0.14)], RED)
+
+
+def _scene_tech(r, x, y, w, h):
+    r.box(x, y, w, h, NIGHT)
+    _rbox(r, x, y, w, h, 0.32, 0.25, 0.68, 0.75, (40, 50, 80))
+    _rbox(r, x, y, w, h, 0.40, 0.35, 0.60, 0.65, TEAL)
+    for fy in (0.32, 0.50, 0.68):
+        _rseg(r, x, y, w, h, 0.16, fy, 0.32, fy, 0.03, GOLD)
+        _rseg(r, x, y, w, h, 0.68, fy, 0.84, fy, 0.03, GOLD)
+    for fx in (0.40, 0.50, 0.60):
+        _rseg(r, x, y, w, h, fx, 0.10, fx, 0.25, 0.03, GOLD)
+        _rseg(r, x, y, w, h, fx, 0.75, fx, 0.90, 0.03, GOLD)
+
+
+def _scene_trophy(r, x, y, w, h):
+    r.box(x, y, w, h, SKY)
+    _rpoly(r, x, y, w, h, [(0.30, 0.15), (0.70, 0.15), (0.64, 0.45),
+                           (0.36, 0.45)], GOLD)
+    _rseg(r, x, y, w, h, 0.30, 0.20, 0.16, 0.32, 0.04, GOLD)
+    _rseg(r, x, y, w, h, 0.70, 0.20, 0.84, 0.32, 0.04, GOLD)
+    _rbox(r, x, y, w, h, 0.46, 0.45, 0.54, 0.62, GOLD)
+    _rbox(r, x, y, w, h, 0.34, 0.62, 0.66, 0.72, (150, 110, 40))
+    _rdisc(r, x, y, w, h, 0.50, 0.30, 0.06, WHITE)
+
+
+def _scene_football(r, x, y, w, h):
+    r.box(x, y, w, h, SKY)
+    r.box(x, _fy(y, h, 0.60), w, h * 0.40, GREEN)
+    _rseg(r, x, y, w, h, 0.05, 0.60, 0.95, 0.60, 0.02, WHITE)
+    _rdisc(r, x, y, w, h, 0.50, 0.42, 0.20, WHITE)
+    _rdisc(r, x, y, w, h, 0.50, 0.42, 0.07, INK)
+    for fx, fy in ((0.34, 0.30), (0.66, 0.30), (0.34, 0.54), (0.66, 0.54)):
+        _rdisc(r, x, y, w, h, fx, fy, 0.035, INK)
+
+
+_SCENE_PAINT = {
+    "tanker": _scene_tanker,
+    "drone": _scene_drone,
+    "parade": _scene_parade,
+    "city": _scene_city,
+    "energy": _scene_energy,
+    "chart": _scene_chart,
+    "flag": _scene_flag,
+    "generic": _scene_generic,
+    "court": _scene_court,
+    "ship": _scene_ship,
+    "cricket": _scene_cricket,
+    "education": _scene_education,
+    "election": _scene_election,
+    "fire": _scene_fire,
+    "health": _scene_health,
+    "market": _scene_market,
+    "protest": _scene_protest,
+    "radar": _scene_radar,
+    "space": _scene_space,
+    "summit": _scene_summit,
+    "tech": _scene_tech,
+    "trophy": _scene_trophy,
+    "football": _scene_football,
+}
+
+
+def paint_scene(raster, kind, x, y, w, h):
+    """Paint one flat illustrated scene into the rectangle (x, y, w, h)."""
+    painter = _SCENE_PAINT.get(kind, _scene_generic)
+    painter(raster, x, y, w, h)
