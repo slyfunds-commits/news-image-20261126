@@ -29,12 +29,12 @@ mkdir -p out && MAKEFUN_OUTPUT_DIR=out python3 main.py
 
 ## Status
 
-⚠️ **Placeholder data.** The data files currently hold placeholder
-stories and numbers for renderer testing only. The real 26 November
-news is filled in during 26 November, verified against two outlets per
-story, and this page is never submitted with placeholder data. Before
-any submit the page is rendered at 300px wide and every line is read
-aloud against the zero-mistake checklist.
+✅ **Filled with real 26 November 2026 news.** Every story, number,
+timeline entry and date-check item is the day's real verified news
+(two outlets per story, checked the morning of 27 November 2026),
+rendered from `stories.json` + `numbers.json`.
+Before submit the page is rendered at 300px wide and every line is
+read aloud against the zero-mistake checklist.
 
 ## About
 
